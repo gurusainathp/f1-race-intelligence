@@ -1,0 +1,28 @@
+# Core
+numpy
+pandas
+scipy
+
+# Visualization
+matplotlib
+seaborn
+plotly
+
+# Machine Learning
+scikit-learn
+xgboost
+
+# Dashboard
+streamlit
+
+# Database
+sqlalchemy
+
+# Utilities
+pyyaml
+joblib
+tqdm
+
+# Optional but recommended
+jupyter
+ipykernel

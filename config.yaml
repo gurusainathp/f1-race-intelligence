@@ -1,0 +1,4 @@
+data_path: data/raw/
+processed_path: data/processed/
+model_path: models/
+report_path: reports/
