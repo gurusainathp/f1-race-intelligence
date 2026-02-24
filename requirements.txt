@@ -18,6 +18,9 @@ streamlit
 # Database
 sqlalchemy
 
+# Data Ingestion
+kagglehub
+
 # Utilities
 pyyaml
 joblib

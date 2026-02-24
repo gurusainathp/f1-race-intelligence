@@ -1,4 +1,19 @@
-data_path: data/raw/
-processed_path: data/processed/
-model_path: models/
-report_path: reports/
+project:
+  name: "F1 Race Intelligence System"
+  version: "0.1.0"
+
+paths:
+  raw_data: "data/raw"
+  interim_data: "data/interim"
+  processed_data: "data/processed"
+  models: "models"
+  reports: "reports"
+
+model:
+  target: "positionOrder"
+  test_size: 0.2
+  random_state: 42
+
+features:
+  use_rolling_metrics: true
+  rolling_window: 5
