@@ -113,7 +113,7 @@ MASTER_TABLE_COLS = [
     "constructorId", "constructorRef", "constructor_name", "constructor_nationality",
     # Race result
     "grid", "position", "positionText", "positionOrder",
-    "points", "laps", "milliseconds", "statusId",
+    "points", "laps", "milliseconds", "statusId", "status",
     "is_dnf", "is_podium",
     "fastestLap", "rank", "fastestLapTime_ms", "fastestLapSpeed",
     # Qualifying
@@ -159,6 +159,29 @@ def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
     # Derived columns
     # -----------------------------------------------------------------------
 
+    # DNF Type Classification
+    mechanical_keywords = [
+        "Engine", "Gearbox", "Transmission", "Hydraulics",
+        "Electrical", "Suspension", "Brakes", "Clutch",
+        "Oil leak", "Fuel", "Tyre", "Water leak",
+        "Driveshaft", "Radiator", "Power Unit"
+    ]
+    crash_keywords = [
+        "Accident", "Collision", "Spun off",
+        "Damage", "Collision damage"
+    ]
+
+    def classify_dnf(status: str):
+        if pd.isna(status) or status == "Finished" or status.startswith("+"):
+            return None
+        if any(keyword in status for keyword in mechanical_keywords):
+            return "mechanical"
+        if any(keyword in status for keyword in crash_keywords):
+            return "crash"
+        return "other"
+
+    df["dnf_type"] = df["status"].apply(classify_dnf)
+
     # grid_vs_finish_delta: positive = gained positions from start to finish.
     # Only populated for classified finishers (position not null).
     df["grid_vs_finish_delta"] = np.where(
@@ -190,7 +213,7 @@ def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
     # -----------------------------------------------------------------------
     extra_cols = [
         "grid_vs_finish_delta", "is_points_finish",
-        "is_winner", "constructor_season_key",
+        "is_winner", "constructor_season_key", "dnf_type",
     ]
     final_cols = [c for c in MASTER_TABLE_COLS if c in df.columns] + extra_cols
 

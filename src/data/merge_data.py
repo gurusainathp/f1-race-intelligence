@@ -81,7 +81,7 @@ def load_clean_tables(interim_dir: Path) -> dict[str, pd.DataFrame]:
     """
     tables = [
         "circuits", "drivers", "constructors", "races",
-        "results", "qualifying", "lap_times", "pit_stops",
+        "results", "qualifying", "lap_times", "pit_stops", "status",
     ]
     loaded = {}
     for name in tables:
@@ -296,6 +296,17 @@ def build_merged_dataset(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
     log.info("  After + constructors:   %d rows", len(df))
 
     # -----------------------------------------------------------------------
+    # Step 5b: + status
+    # -----------------------------------------------------------------------
+    df = df.merge(
+        tables["status"],
+        on="statusId",
+        how="left",
+        validate="many_to_one"
+    )
+    log.info("  After + status:         %d rows", len(df))
+
+    # -----------------------------------------------------------------------
     # Step 6: + qualifying (aggregated to one row per driver per race)
     # -----------------------------------------------------------------------
     qual_agg = aggregate_qualifying(tables["qualifying"])
@@ -398,7 +409,7 @@ _CONSTRUCTOR_COLS = [
 ]
 _RESULT_COLS = [
     "resultId", "grid", "position", "positionText", "positionOrder",
-    "points", "laps", "milliseconds", "statusId",
+    "points", "laps", "milliseconds", "statusId", "status",
     "is_dnf", "is_podium",
     "fastestLap", "rank", "fastestLapTime_ms", "fastestLapSpeed",
 ]

@@ -21,6 +21,7 @@ REQUIRED_FILES = [
     "lap_times.csv",
     "pit_stops.csv",
     "constructors.csv",
+    "status.csv",
 ]
 
 

@@ -465,6 +465,21 @@ def clean_pit_stops(df: pd.DataFrame) -> pd.DataFrame:
     log_shape("pit_stops", n0, df)
     return df
 
+def clean_status(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    status.csv -> statusId, status
+
+    Key issues:
+        - Minimal cleaning needed, mostly used as a lookup table.
+    """
+    log.info("Cleaning status...")
+    n0 = len(df)
+
+    df = replace_kaggle_nulls(df)
+    df = strip_string_columns(df)
+
+    log_shape("status", n0, df)
+    return df
 
 # ===========================================================================
 # Orchestrator
@@ -480,6 +495,7 @@ CLEANERS = {
     "qualifying":   clean_qualifying,
     "lap_times":    clean_lap_times,
     "pit_stops":    clean_pit_stops,
+    "status":       clean_status,
 }
 
 
