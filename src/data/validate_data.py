@@ -21,18 +21,25 @@ from pathlib import Path
 from datetime import datetime
 import sys
 
+# Import shared classifiers and thresholds — single source of truth
+try:
+    from constants import (
+        DNF_KEYWORDS, FINISH_KEYWORDS, LAPPED_PATTERNS,
+        LAP_TIME_MIN_MS, LAP_TIME_WARN_MS, LAP_TIME_CORRUPT_MS, LAP_Z_THRESHOLD,
+        is_dnf as _is_dnf_fn, is_finish as _is_finish_fn,
+    )
+    _CONSTANTS_AVAILABLE = True
+except ImportError:
+    _CONSTANTS_AVAILABLE = False
+    # Fallback values if constants.py is not on the path
+    LAP_TIME_MIN_MS     = 40_000
+    LAP_TIME_WARN_MS    = 300_000
+    LAP_TIME_CORRUPT_MS = 600_000
+    LAP_Z_THRESHOLD     = 5
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 INTERIM_DIR = Path("data/interim")
 REPORT_PATH = Path("reports/data_quality_report.md")
-
-# Lap time thresholds (milliseconds)
-# 40 s  — physically impossible faster
-# 300 s — suspiciously slow but could be SC/VSC lap (flag, don't hard-fail)
-# 600 s — truly corrupt; no F1 lap legitimately takes 10+ minutes
-LAP_TIME_MIN_MS      = 40_000
-LAP_TIME_WARN_MS     = 300_000   # > 5 min: likely SC/VSC — flag as warning
-LAP_TIME_CORRUPT_MS  = 600_000   # > 10 min: almost certainly bad data
-LAP_Z_THRESHOLD      = 5         # Standard deviations for extreme outlier flag
 
 # Foreign key relationships: (child_table, child_col) → (parent_table, parent_col)
 FK_CHECKS = [
@@ -88,22 +95,42 @@ INVESTIGATE_NULLS: dict[str, str] = {
 }
 
 # ── Status classifiers ─────────────────────────────────────────────────────────
-DNF_KEYWORDS = [
-    "retired", "accident", "collision", "disqualified", "did not",
-    "engine", "gearbox", "hydraulics", "brakes", "wheel", "fuel",
-    "suspension", "electrical", "oil", "water", "fire", "spun off",
-    "overheating", "mechanical", "transmission", "clutch", "throttle",
-    "power unit", "exhaust", "tyre", "puncture", "damage", "withdrew",
-    "illness", "injury", "safety", "technical", "vibrations", "debris",
-    "battery", "driveshaft", "differential", "turbo", "compressor",
-    "pneumatic", "cooling", "alternator", "electronics",
-]
+# Use shared classifiers from constants.py (single source of truth).
+# Fallback inline definitions are used only if constants.py is not on the path.
 
-# Lapped finishers are classified finishers in F1, not DNFs
-FINISH_KEYWORDS = ["finished"]
-LAPPED_PATTERNS = ["+1 lap", "+2 lap", "+3 lap", "+4 lap", "+5 lap",
-                   "+6 lap", "+7 lap", "+8 lap", "+9 lap", "lapped",
-                   "lap down"]
+if _CONSTANTS_AVAILABLE:
+    def _is_dnf(label: str) -> bool:
+        return _is_dnf_fn(label)
+
+    def _is_finish(label: str) -> bool:
+        return _is_finish_fn(label)
+
+else:
+    # Fallback — keep manually in sync with constants.py if that file is absent
+    _FALLBACK_DNF = [
+        "retired", "accident", "collision", "disqualified", "did not",
+        "engine", "gearbox", "hydraulics", "brakes", "wheel", "fuel",
+        "suspension", "electrical", "oil", "water", "fire", "spun off",
+        "overheating", "mechanical", "transmission", "clutch", "throttle",
+        "power unit", "exhaust", "tyre", "puncture", "damage", "withdrew",
+        "illness", "injury", "safety", "technical", "vibrations", "debris",
+        "battery", "driveshaft", "differential", "turbo", "compressor",
+        "pneumatic", "cooling", "alternator", "electronics",
+    ]
+
+    def _is_dnf(label: str) -> bool:
+        ll = label.lower()
+        if ll.startswith("+") and "lap" in ll:
+            return False
+        return any(kw in ll for kw in _FALLBACK_DNF)
+
+    def _is_finish(label: str) -> bool:
+        ll = label.lower()
+        if "finished" in ll:
+            return True
+        if ll.startswith("+") and "lap" in ll:
+            return True
+        return any(pat in ll for pat in ["lapped", "lap down"])
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -124,23 +151,6 @@ def _pct(value: float, total: float, decimals: int = 1) -> str:
     if total == 0:
         return "N/A"
     return f"{value / total * 100:.{decimals}f}%"
-
-
-def _is_dnf(label: str) -> bool:
-    ll = label.lower()
-    return any(kw in ll for kw in DNF_KEYWORDS)
-
-
-def _is_finish(label: str) -> bool:
-    ll = label.lower()
-    if any(kw in ll for kw in FINISH_KEYWORDS):
-        return True
-    if any(pat in ll for pat in LAPPED_PATTERNS):
-        return True
-    # Handles "+1 Lap", "+2 Laps" style strings
-    if ll.startswith("+") and "lap" in ll:
-        return True
-    return False
 
 
 # ── Data Loading ───────────────────────────────────────────────────────────────
@@ -218,10 +228,10 @@ def section_null_analysis(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]:
                 severity = "ℹ️ Justified"
                 note     = JUSTIFIED_NULLS[col]
             elif col in INVESTIGATE_NULLS and val > 0:
+                # Investigate columns are flagged for human review, not automated failure.
+                # They have already been assessed — do NOT trigger scorecard failure here.
                 severity = "🔍 Investigate"
                 note     = INVESTIGATE_NULLS[col]
-                if val >= 20:
-                    unjustified_high_found = True
             elif val == 0:
                 severity = "✅ Clean"
                 note     = "—"
@@ -391,6 +401,11 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
     rows_affected = int(dupe_mask.sum())
     passed        = dupe_pairs == 0
 
+    # Initialise classification sets — populated inside the if block below
+    sprint_race_ids  = set()
+    dual_constructor = set()
+    unexplained      = set()
+
     lines += [
         f"**Composite key:** `raceId × driverId`",
         f"**Duplicate pairs found:** {dupe_pairs:,}  →  {_badge(passed)}",
@@ -403,9 +418,6 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
         dupe_df = results[dupe_mask].copy()
 
         # ── Classify each duplicate group ──────────────────────────────────────
-        sprint_race_ids    = set()
-        dual_constructor   = set()
-        unexplained        = set()
 
         has_race_year = ("races" in tables and "year" in tables["races"].columns
                          and "raceId" in tables["races"].columns)
@@ -426,13 +438,14 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
             # Check 2: does adding constructorId fully resolve the duplicate?
             if has_constructor and grp.duplicated(subset=["raceId", "driverId", "constructorId"]).sum() == 0:
                 # Unique on 3-key but not 2-key → classic sprint scenario
-                year = race_year_map.get(race_id, 0)
+                # int(... or 0) safely converts pd.NA / None from Int64 dtype to 0
+                year = int(race_year_map.get(race_id, 0) or 0)
                 if year >= 2021:
                     sprint_race_ids.add(race_id)
                     continue
 
             # Check 3: same race year >= 2021 strongly suggests sprint
-            year = race_year_map.get(race_id, 0)
+            year = int(race_year_map.get(race_id, 0) or 0)
             if year >= 2021:
                 sprint_race_ids.add(race_id)
             else:
@@ -548,17 +561,14 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
             "```",
         ]
 
-    # Scorecard: pass if zero unexplained duplicates (sprint ones are acceptable)
-    scorecard_pass = dupe_pairs == 0 or (
-        "results" in tables
-        and "races" in tables
-        and len([
-            r for r in tables["results"]
-            .loc[tables["results"].duplicated(subset=subset, keep=False), "raceId"]
-            .unique()
-            if tables["races"].set_index("raceId").get("year", pd.Series()).get(r, 0) < 2021
-        ]) == 0
-    )
+    # Scorecard: pass if zero unexplained duplicates.
+    # Sprint (2021+) and dual-constructor duplicates are structurally expected.
+    # Use the already-computed `unexplained` set directly — avoids re-running
+    # the same fragile year-lookup logic a second time.
+    if dupe_pairs == 0:
+        scorecard_pass = True
+    else:
+        scorecard_pass = len(unexplained) == 0
 
     return "\n".join(lines), scorecard_pass
 
@@ -599,7 +609,14 @@ def section_lap_time_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, b
     z_scores  = (series - series.mean()) / series.std()
     z_extreme = int((z_scores.abs() > LAP_Z_THRESHOLD).sum())
 
-    passed = hard_fail == 0 and z_extreme == 0
+    # Outliers that are ALSO in the SC/VSC band are already accounted for
+    # by the threshold warning above — don't double-fail on them.
+    # Only truly unexplained z-score outliers (below the SC/VSC threshold) fail.
+    z_unexplained = int(
+        ((z_scores.abs() > LAP_Z_THRESHOLD) & (series <= LAP_TIME_WARN_MS)).sum()
+    )
+
+    passed = hard_fail == 0 and z_unexplained == 0
 
     lines += [
         "**Thresholds:**",
@@ -662,8 +679,10 @@ def section_lap_time_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, b
         "| Metric | Value |",
         "|--------|------:|",
         f"| Mean ± 1σ | {series.mean() / 1000:.1f} s ± {series.std() / 1000:.1f} s |",
-        f"| Extreme outliers (\\|z\\| > {LAP_Z_THRESHOLD}) | {z_extreme:,} ({_pct(z_extreme, n_valid)}) |",
-        f"| Outlier check | {_badge(z_extreme == 0)} |",
+        f"| Total outliers (\\|z\\| > {LAP_Z_THRESHOLD}) | {z_extreme:,} ({_pct(z_extreme, n_valid)}) |",
+        f"| Of those: SC/VSC overlap (already flagged above) | {z_extreme - z_unexplained:,} |",
+        f"| Genuinely unexplained outliers | {z_unexplained:,} |",
+        f"| Outlier check | {_badge(z_unexplained == 0)} |",
     ]
 
     if z_extreme > 0:

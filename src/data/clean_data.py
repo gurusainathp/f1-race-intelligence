@@ -12,10 +12,23 @@ Cleaning operations per table:
   drivers      : parse DOB, normalize nulls, deduplicate on driverRef
   constructors : strip whitespace, normalize nulls
   races        : parse date, validate rounds, drop session time columns
-  results      : coerce numerics, standardize status, encode is_dnf / is_podium
+  results      : coerce numerics, encode is_dnf / is_podium
   qualifying   : parse lap times to milliseconds, derive best_quali_ms
   lap_times    : parse lap times to milliseconds, remove implausible values
   pit_stops    : parse duration to milliseconds, remove implausible values
+  status       : normalize nulls (lookup table — minimal cleaning needed)
+
+Notes on is_dnf:
+  clean_results() sets is_dnf as a quick interim flag based on positionText
+  codes (R/D/E/W/F/N). This is intentionally coarse — it covers all
+  non-finishers but does not distinguish failure cause.
+  merge_data.py and build_master_table.py recompute is_dnf and add
+  dnf_type ('mechanical' / 'crash' / 'other') from the authoritative
+  status label using constants.py classifiers. The interim flag exists
+  only so results_clean.csv is self-contained before the merge step.
+  The POSITION_TEXT_DNF_CODES set used here is defined in constants.py
+  alongside the status-label classifiers so both derivations are
+  maintained in one place.
 
 Output:
   One cleaned CSV per table written to data/interim/
@@ -33,6 +46,18 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yaml
+
+from constants import (
+    # Numeric thresholds — single source of truth, shared with validate_data.py
+    LAP_TIME_MIN_MS,
+    LAP_TIME_MAX_MS,
+    PIT_STOP_MIN_MS,
+    PIT_STOP_MAX_MS,
+    LAT_MIN, LAT_MAX,
+    LNG_MIN, LNG_MAX,
+    # DNF positionText codes — kept alongside status classifiers in constants.py
+    POSITION_TEXT_DNF_CODES,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -59,12 +84,12 @@ def _load_config() -> dict:
 
 
 _CONFIG = _load_config()
-RAW_DIR = Path(_CONFIG.get("paths", {}).get("raw_data", "data/raw"))
+RAW_DIR     = Path(_CONFIG.get("paths", {}).get("raw_data",     "data/raw"))
 INTERIM_DIR = Path(_CONFIG.get("paths", {}).get("interim_data", "data/interim"))
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# Module-level constants (non-threshold)
 # ---------------------------------------------------------------------------
 
 # The Kaggle dataset encodes all missing values as the literal string "\N"
@@ -72,18 +97,6 @@ KAGGLE_NULL = r"\N"
 
 # Lap time regex: matches "M:SS.mmm" or "MM:SS.mmm"
 LAP_TIME_PATTERN = re.compile(r"^(\d{1,2}):(\d{2})\.(\d{3})$")
-
-# Reasonable lap time bounds (milliseconds)
-LAP_TIME_MIN_MS = 30_000    # 30 s  — absolute floor (formation / pit exit laps)
-LAP_TIME_MAX_MS = 900_000   # 15 min — beyond this is a red-flag halt or data error
-
-# Pit stop duration bounds (milliseconds)
-PIT_STOP_MIN_MS = 15_000    # 15 s — world record territory
-PIT_STOP_MAX_MS = 300_000   # 5 min — anything longer is a repair or drive-through
-
-# GPS coordinate bounds
-LAT_MIN, LAT_MAX = -90.0, 90.0
-LNG_MIN, LNG_MAX = -180.0, 180.0
 
 
 # ===========================================================================
@@ -115,7 +128,7 @@ def lap_time_to_ms(time_str) -> float:
         return np.nan
     minutes = int(match.group(1))
     seconds = int(match.group(2))
-    millis = int(match.group(3))
+    millis  = int(match.group(3))
     return float(minutes * 60_000 + seconds * 1_000 + millis)
 
 
@@ -162,26 +175,31 @@ def clean_circuits(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["lat", "lng", "alt"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Null out coordinates outside valid GPS bounds
+    # Null out coordinates outside valid GPS bounds (from constants.py)
     invalid_lat = df["lat"].notna() & ((df["lat"] < LAT_MIN) | (df["lat"] > LAT_MAX))
     invalid_lng = df["lng"].notna() & ((df["lng"] < LNG_MIN) | (df["lng"] > LNG_MAX))
     df.loc[invalid_lat, "lat"] = np.nan
     df.loc[invalid_lng, "lng"] = np.nan
     if invalid_lat.sum() or invalid_lng.sum():
-        log.warning("  Nulled %d invalid lat / %d invalid lng.", invalid_lat.sum(), invalid_lng.sum())
+        log.warning(
+            "  Nulled %d invalid lat / %d invalid lng.",
+            invalid_lat.sum(), invalid_lng.sum(),
+        )
 
-    # Fill missing altitude with median -- low-impact feature, median is safe
+    # Fill missing altitude with median — low-impact feature, median is safe
     if df["alt"].isna().any():
         median_alt = df["alt"].median()
-        n_filled = df["alt"].isna().sum()
+        n_filled   = df["alt"].isna().sum()
         df["alt"].fillna(median_alt, inplace=True)
-        log.info("  Filled %d missing alt values with median (%.0f m).", n_filled, median_alt)
+        log.info(
+            "  Filled %d missing alt values with median (%.0f m).",
+            n_filled, median_alt,
+        )
 
-    # Standardize a handful of known country name variants
     df["country"] = df["country"].replace({
-        "UK": "United Kingdom",
-        "USA": "United States",
-        "UAE": "United Arab Emirates",
+        "UK":    "United Kingdom",
+        "USA":   "United States",
+        "UAE":   "United Arab Emirates",
         "Korea": "South Korea",
     })
 
@@ -207,16 +225,10 @@ def clean_drivers(df: pd.DataFrame) -> pd.DataFrame:
     df = strip_string_columns(df)
     df.drop(columns=["url"], inplace=True, errors="ignore")
 
-    # Convenience full name column
     df["full_name"] = df["forename"].str.strip() + " " + df["surname"].str.strip()
+    df["dob"]       = pd.to_datetime(df["dob"], errors="coerce")
+    df["number"]    = pd.to_numeric(df["number"], errors="coerce").astype("Int64")
 
-    # Date of birth -> datetime
-    df["dob"] = pd.to_datetime(df["dob"], errors="coerce")
-
-    # Permanent number -- only meaningful post-2014
-    df["number"] = pd.to_numeric(df["number"], errors="coerce").astype("Int64")
-
-    # Deduplicate on natural key
     dupes = df.duplicated(subset=["driverRef"], keep="first").sum()
     if dupes:
         log.warning("  Dropping %d duplicate driverRef rows.", dupes)
@@ -229,10 +241,6 @@ def clean_drivers(df: pd.DataFrame) -> pd.DataFrame:
 def clean_constructors(df: pd.DataFrame) -> pd.DataFrame:
     """
     constructors.csv  ->  constructorId, constructorRef, name, nationality
-
-    Key issues:
-      - \\N in nationality for obscure historic entrants
-      - url not needed
     """
     log.info("Cleaning constructors...")
     n0 = len(df)
@@ -253,7 +261,7 @@ def clean_races(df: pd.DataFrame) -> pd.DataFrame:
     Key issues:
       - date: string -- parse to datetime
       - time, fp*_time, quali_time, sprint_time: very sparse, dropped
-      - \\N across all session date columns for pre-modern seasons (expected)
+      - \\N across session date columns for pre-modern seasons (expected null)
       - url not needed
     """
     log.info("Cleaning races...")
@@ -263,22 +271,20 @@ def clean_races(df: pd.DataFrame) -> pd.DataFrame:
     df = strip_string_columns(df)
     df.drop(columns=["url"], inplace=True, errors="ignore")
 
-    # Primary race date
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     unparseable = df["date"].isna().sum()
     if unparseable:
         log.warning("  Dropping %d rows with unparseable race dates.", unparseable)
         df = df[df["date"].notna()]
 
-    df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
+    df["year"]  = pd.to_numeric(df["year"],  errors="coerce").astype("Int64")
     df["round"] = pd.to_numeric(df["round"], errors="coerce").astype("Int64")
 
-    # Parse session date columns -- NaT for historic seasons is expected and fine
     for col in ["fp1_date", "fp2_date", "fp3_date", "quali_date", "sprint_date"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    # Drop all session time columns -- very sparse, not used in modelling
+    # Drop session time columns — very sparse, not used in modelling
     time_cols = ["time", "fp1_time", "fp2_time", "fp3_time", "quali_time", "sprint_time"]
     df.drop(columns=[c for c in time_cols if c in df.columns], inplace=True)
 
@@ -295,11 +301,21 @@ def clean_results(df: pd.DataFrame) -> pd.DataFrame:
                      is_dnf, is_podium
 
     Key issues:
-      - position: \\N when driver did not finish -- correct, not a data error
-      - grid = 0: pit-lane starts -- recoded to NaN for modelling
-      - fastestLapTime: "M:SS.mmm" string -- parsed to milliseconds
+      - position: \\N when driver did not finish — correct, not a data error
+      - grid = 0: pit-lane starts — recoded to NaN for modelling
+      - fastestLapTime: "M:SS.mmm" string — parsed to milliseconds
       - positionText encodes retirement codes: R, D, E, W, F, N
       - points should always be non-negative
+
+    is_dnf derivation:
+      Set here from POSITION_TEXT_DNF_CODES (imported from constants.py)
+      as a quick interim flag so results_clean.csv is self-contained.
+      This flag is intentionally coarse — it marks all non-finishers
+      but does NOT distinguish failure cause.
+      merge_data.py recomputes is_dnf from the status label (authoritative)
+      and adds dnf_type ('mechanical'/'crash'/'other') via constants.py
+      classifiers. build_master_table.py cross-validates the two derivations
+      and logs any discrepancies.
     """
     log.info("Cleaning results...")
     n0 = len(df)
@@ -307,18 +323,15 @@ def clean_results(df: pd.DataFrame) -> pd.DataFrame:
     df = replace_kaggle_nulls(df)
     df = strip_string_columns(df)
 
-    # Integer columns
     for col in ["grid", "positionOrder", "laps", "statusId", "fastestLap", "rank"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
 
-    # Float columns
     for col in ["points", "milliseconds", "fastestLapSpeed"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # position: nullable integer -- NaN correctly means did not finish
     df["position"] = pd.to_numeric(df["position"], errors="coerce").astype("Int64")
 
-    # Grid 0 = pit-lane start -- ambiguous for modelling, set to NaN
+    # Grid 0 = pit-lane start — ambiguous for modelling, set to NaN
     pit_lane_starts = (df["grid"] == 0).sum()
     if pit_lane_starts:
         log.info("  Recoded %d pit-lane starts (grid=0) to NaN.", pit_lane_starts)
@@ -329,13 +342,19 @@ def clean_results(df: pd.DataFrame) -> pd.DataFrame:
     df = null_out_outliers(df, "fastestLapTime_ms", LAP_TIME_MIN_MS, LAP_TIME_MAX_MS)
     df.drop(columns=["fastestLapTime"], inplace=True)
 
-    # DNF flag
-    # positionText values: R=retired, D=disqualified, E=excluded,
-    # W=withdrew, F=failed to qualify, N=not classified
-    dnf_codes = {"R", "D", "E", "W", "F", "N"}
-    df["is_dnf"] = df["positionText"].isin(dnf_codes).astype("int8")
+    # ── is_dnf interim flag ────────────────────────────────────────────────
+    # Uses POSITION_TEXT_DNF_CODES from constants.py — the same module that
+    # defines the status-label classifiers used downstream. Any change to
+    # what counts as a DNF should be made there, not here.
+    df["is_dnf"] = df["positionText"].isin(POSITION_TEXT_DNF_CODES).astype("int8")
 
-    # Podium flag -- finished classified in P1, P2, or P3
+    n_dnf = int(df["is_dnf"].sum())
+    log.info(
+        "  is_dnf (interim, from positionText): %d DNFs / %d total (%.1f%%)",
+        n_dnf, len(df), n_dnf / len(df) * 100,
+    )
+
+    # Podium flag — finished classified in P1, P2, or P3
     df["is_podium"] = (df["position"].notna() & df["position"].le(3)).astype("int8")
 
     # Sanity: points should never be negative
@@ -355,7 +374,7 @@ def clean_qualifying(df: pd.DataFrame) -> pd.DataFrame:
 
     Key issues:
       - q1/q2/q3: \\N when driver was eliminated or format not applicable
-      - Lap times as "M:SS.mmm" strings -- convert to milliseconds
+      - Lap times as "M:SS.mmm" strings — convert to milliseconds
       - best_quali_ms = minimum of available session times
     """
     log.info("Cleaning qualifying...")
@@ -365,15 +384,14 @@ def clean_qualifying(df: pd.DataFrame) -> pd.DataFrame:
     df = strip_string_columns(df)
 
     df["position"] = pd.to_numeric(df["position"], errors="coerce").astype("Int64")
-    df["number"] = pd.to_numeric(df["number"], errors="coerce").astype("Int64")
+    df["number"]   = pd.to_numeric(df["number"],   errors="coerce").astype("Int64")
 
     for q_col in ["q1", "q2", "q3"]:
-        ms_col = f"{q_col}_ms"
+        ms_col    = f"{q_col}_ms"
         df[ms_col] = df[q_col].apply(lap_time_to_ms)
         df = null_out_outliers(df, ms_col, LAP_TIME_MIN_MS, LAP_TIME_MAX_MS)
         df.drop(columns=[q_col], inplace=True)
 
-    # Best qualifying time = fastest session completed by this driver
     df["best_quali_ms"] = df[["q1_ms", "q2_ms", "q3_ms"]].min(axis=1)
 
     log_shape("qualifying", n0, df)
@@ -385,26 +403,28 @@ def clean_lap_times(df: pd.DataFrame) -> pd.DataFrame:
     lap_times.csv  ->  raceId, driverId, lap, position, lap_time_ms
 
     Key issues:
-      - time: "M:SS.mmm" string -- preferred source for milliseconds value
-      - milliseconds: pre-computed column -- used as fallback (rounding artefacts)
-      - Safety car / VSC laps are legitimately slow -- use wider outlier bounds
-      - Large file (~500K rows) -- use efficient integer dtypes
+      - time: "M:SS.mmm" string — preferred source for milliseconds value
+      - milliseconds: pre-computed column — used as fallback (rounding artefacts)
+      - Safety car / VSC laps are legitimately slow — thresholds from constants.py
+        use LAP_TIME_MIN_MS=30s and LAP_TIME_MAX_MS=600s. Laps between 300–600s
+        (SC/VSC) pass through cleaning; validate_data.py flags them separately
+        as warnings so they can be excluded from pace analysis without being lost.
+      - Large file (~500K rows) — use efficient integer dtypes
     """
-    log.info("Cleaning lap_times (large file -- may take a moment)...")
+    log.info("Cleaning lap_times (large file — may take a moment)...")
     n0 = len(df)
 
     df = replace_kaggle_nulls(df)
     df = strip_string_columns(df)
 
-    # Efficient dtypes before heavy operations
-    df["raceId"] = pd.to_numeric(df["raceId"], errors="coerce").astype("Int32")
-    df["driverId"] = pd.to_numeric(df["driverId"], errors="coerce").astype("Int32")
-    df["lap"] = pd.to_numeric(df["lap"], errors="coerce").astype("Int16")
-    df["position"] = pd.to_numeric(df["position"], errors="coerce").astype("Int8")
+    df["raceId"]    = pd.to_numeric(df["raceId"],    errors="coerce").astype("Int32")
+    df["driverId"]  = pd.to_numeric(df["driverId"],  errors="coerce").astype("Int32")
+    df["lap"]       = pd.to_numeric(df["lap"],       errors="coerce").astype("Int16")
+    df["position"]  = pd.to_numeric(df["position"],  errors="coerce").astype("Int8")
 
     # String parse takes priority; fall back to pre-computed milliseconds column
     df["lap_time_ms"] = df["time"].apply(lap_time_to_ms)
-    ms_fallback = pd.to_numeric(df["milliseconds"], errors="coerce")
+    ms_fallback       = pd.to_numeric(df["milliseconds"], errors="coerce")
     df["lap_time_ms"] = df["lap_time_ms"].combine_first(ms_fallback)
 
     df.drop(columns=["time", "milliseconds"], inplace=True)
@@ -413,7 +433,9 @@ def clean_lap_times(df: pd.DataFrame) -> pd.DataFrame:
     # Drop rows where lap time is still null after fallback
     null_count = df["lap_time_ms"].isna().sum()
     if null_count:
-        log.warning("  Dropping %d rows with unresolvable null lap times.", null_count)
+        log.warning(
+            "  Dropping %d rows with unresolvable null lap times.", null_count,
+        )
         df = df[df["lap_time_ms"].notna()]
 
     log_shape("lap_times", n0, df)
@@ -426,9 +448,10 @@ def clean_pit_stops(df: pd.DataFrame) -> pd.DataFrame:
 
     Key issues:
       - duration: string in "SS.mmm" (under 1 min) or "M:SS.mmm" format
-      - milliseconds: pre-computed -- used as fallback
-      - time: wall-clock time of day -- not useful for modelling, dropped
-      - Implausibly short (<15 s) or long (>5 min) durations nulled out
+      - milliseconds: pre-computed — used as fallback
+      - time: wall-clock time of day — not useful for modelling, dropped
+      - Implausibly short/long durations nulled using PIT_STOP bounds
+        from constants.py
     """
     log.info("Cleaning pit_stops...")
     n0 = len(df)
@@ -436,10 +459,10 @@ def clean_pit_stops(df: pd.DataFrame) -> pd.DataFrame:
     df = replace_kaggle_nulls(df)
     df = strip_string_columns(df)
 
-    df["raceId"] = pd.to_numeric(df["raceId"], errors="coerce").astype("Int32")
+    df["raceId"]   = pd.to_numeric(df["raceId"],   errors="coerce").astype("Int32")
     df["driverId"] = pd.to_numeric(df["driverId"], errors="coerce").astype("Int32")
-    df["stop"] = pd.to_numeric(df["stop"], errors="coerce").astype("Int8")
-    df["lap"] = pd.to_numeric(df["lap"], errors="coerce").astype("Int16")
+    df["stop"]     = pd.to_numeric(df["stop"],     errors="coerce").astype("Int8")
+    df["lap"]      = pd.to_numeric(df["lap"],      errors="coerce").astype("Int16")
 
     def _parse_duration(val) -> float:
         """Handle both 'SS.mmm' (under 1 min) and 'M:SS.mmm' formats."""
@@ -449,28 +472,32 @@ def clean_pit_stops(df: pd.DataFrame) -> pd.DataFrame:
         if ":" in val:
             return lap_time_to_ms(val)
         try:
-            return float(val) * 1_000.0  # seconds -> milliseconds
+            return float(val) * 1_000.0   # seconds -> milliseconds
         except ValueError:
             return np.nan
 
     df["pit_duration_ms"] = df["duration"].apply(_parse_duration)
-    ms_fallback = pd.to_numeric(df["milliseconds"], errors="coerce")
+    ms_fallback           = pd.to_numeric(df["milliseconds"], errors="coerce")
     df["pit_duration_ms"] = df["pit_duration_ms"].combine_first(ms_fallback)
 
     df = null_out_outliers(df, "pit_duration_ms", PIT_STOP_MIN_MS, PIT_STOP_MAX_MS)
 
-    # Drop raw string columns -- pit_duration_ms is the clean derived value
-    df.drop(columns=["duration", "milliseconds", "time"], inplace=True, errors="ignore")
+    df.drop(
+        columns=["duration", "milliseconds", "time"],
+        inplace=True, errors="ignore",
+    )
 
     log_shape("pit_stops", n0, df)
     return df
 
+
 def clean_status(df: pd.DataFrame) -> pd.DataFrame:
     """
-    status.csv -> statusId, status
+    status.csv  ->  statusId, status
 
-    Key issues:
-        - Minimal cleaning needed, mostly used as a lookup table.
+    Minimal cleaning — this is a small lookup table (139 rows).
+    Its 'status' column is the authoritative source for is_dnf derivation
+    in merge_data.py and build_master_table.py via constants.py classifiers.
     """
     log.info("Cleaning status...")
     n0 = len(df)
@@ -478,8 +505,15 @@ def clean_status(df: pd.DataFrame) -> pd.DataFrame:
     df = replace_kaggle_nulls(df)
     df = strip_string_columns(df)
 
+    # Verify expected columns are present
+    for col in ["statusId", "status"]:
+        if col not in df.columns:
+            log.warning("  Expected column '%s' missing from status table.", col)
+
+    log.info("  %d unique status categories.", df["status"].nunique())
     log_shape("status", n0, df)
     return df
+
 
 # ===========================================================================
 # Orchestrator
@@ -500,7 +534,7 @@ CLEANERS = {
 
 
 def run_cleaning(
-    raw_dir: Path = RAW_DIR,
+    raw_dir:     Path = RAW_DIR,
     interim_dir: Path = INTERIM_DIR,
 ) -> dict:
     """
@@ -526,7 +560,7 @@ def run_cleaning(
         raw_path = raw_dir / f"{table_name}.csv"
 
         if not raw_path.exists():
-            log.warning("Raw file not found -- skipping: %s", raw_path)
+            log.warning("Raw file not found — skipping: %s", raw_path)
             continue
 
         log.info("=" * 55)
@@ -546,8 +580,7 @@ def run_cleaning(
     log.info("=" * 55)
     log.info(
         "Cleaning complete. %d tables written to %s/",
-        len(cleaned),
-        interim_dir,
+        len(cleaned), interim_dir,
     )
     return cleaned
 

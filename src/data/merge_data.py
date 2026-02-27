@@ -20,12 +20,14 @@ Join logic (all LEFT joins from results as the spine):
     + circuits     <- circuit metadata (name, country, lat, lng, alt)
     + drivers      <- driver identity (full_name, nationality, dob)
     + constructors <- team identity (name, nationality)
+    + status       <- status label for statusId (for is_dnf derivation)
     + qualifying   <- qualifying position and session times
     + pit_stops    <- aggregated pit stop metrics per driver per race
     + lap_times    <- aggregated lap time metrics per driver per race
 
-Qualifying and pit_stops / lap_times are pre-aggregated before joining
-so the spine row count (one per driver per race) is preserved.
+Status is joined early (after constructors) so that is_dnf and dnf_type
+can be derived from the authoritative status label, not from a pre-existing
+flag that may have been set inconsistently in clean_data.py.
 
 Run:
   python src/data/merge_data.py
@@ -38,6 +40,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yaml
+
+from constants import (
+    compute_is_dnf_series,
+    compute_dnf_type_series,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -105,10 +112,6 @@ def aggregate_qualifying(df_qual: pd.DataFrame) -> pd.DataFrame:
     """
     Reduce qualifying to one row per (raceId, driverId).
 
-    The cleaned qualifying table already has one row per driver per race,
-    but we rename columns for clarity and keep only what is needed for
-    the join.
-
     Columns retained:
       raceId, driverId, quali_position, q1_ms, q2_ms, q3_ms, best_quali_ms
     """
@@ -119,8 +122,6 @@ def aggregate_qualifying(df_qual: pd.DataFrame) -> pd.DataFrame:
     # Drop constructorId and number — duplicated in results
     df = df.drop(columns=["constructorId", "number"], errors="ignore")
 
-    # Guard: keep only first qualifying entry per (raceId, driverId)
-    # (should already be unique after cleaning, but belt-and-braces)
     before = len(df)
     df = df.drop_duplicates(subset=["raceId", "driverId"], keep="first")
     if len(df) < before:
@@ -141,10 +142,8 @@ def aggregate_pit_stops(df_pits: pd.DataFrame) -> pd.DataFrame:
       min_pit_duration_ms  : fastest individual stop
     """
     log.info("Aggregating pit_stops...")
-    df = df_pits.copy()
-
     agg = (
-        df.groupby(["raceId", "driverId"])
+        df_pits.groupby(["raceId", "driverId"])
         .agg(
             total_pit_stops=("stop", "count"),
             total_pit_time_ms=("pit_duration_ms", "sum"),
@@ -154,7 +153,6 @@ def aggregate_pit_stops(df_pits: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
 
-    # Round to 1 decimal place for readability
     for col in ["total_pit_time_ms", "avg_pit_duration_ms", "min_pit_duration_ms"]:
         agg[col] = agg[col].round(1)
 
@@ -173,13 +171,10 @@ def aggregate_lap_times(df_laps: pd.DataFrame) -> pd.DataFrame:
       std_lap_time_ms       : standard deviation (consistency proxy)
       fastest_lap_ms        : personal fastest lap in the race
       lap_time_consistency  : 1 - (std / mean), bounded [0, 1]
-                              higher = more consistent lap times
     """
-    log.info("Aggregating lap_times (large -- may take a moment)...")
-    df = df_laps.copy()
-
+    log.info("Aggregating lap_times (large — may take a moment)...")
     agg = (
-        df.groupby(["raceId", "driverId"])["lap_time_ms"]
+        df_laps.groupby(["raceId", "driverId"])["lap_time_ms"]
         .agg(
             laps_completed="count",
             avg_lap_time_ms="mean",
@@ -190,7 +185,6 @@ def aggregate_lap_times(df_laps: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
 
-    # Consistency index: penalizes high variance relative to average pace
     agg["lap_time_consistency"] = (
         1 - (agg["std_lap_time_ms"] / agg["avg_lap_time_ms"])
     ).clip(0, 1).round(4)
@@ -211,61 +205,48 @@ def build_merged_dataset(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
     Join all cleaned tables onto the results spine.
 
     Join order and rationale:
-      1. results         — spine (one row per driver per race, ~25K rows)
+      1. results         — spine (one row per driver per race)
       2. races           — race context: year, round, date, circuitId
       3. circuits        — circuit metadata via circuitId
       4. drivers         — driver identity via driverId
       5. constructors    — team identity via constructorId
-      6. qualifying_agg  — qualifying position + session times
-      7. pit_stops_agg   — aggregated pit stop metrics
-      8. lap_times_agg   — aggregated lap time metrics
+      6. status          — status label via statusId (REQUIRED for is_dnf derivation)
+      7. qualifying_agg  — qualifying position + session times
+      8. pit_stops_agg   — aggregated pit stop metrics
+      9. lap_times_agg   — aggregated lap time metrics
 
-    All joins are LEFT from the results spine so no race result row is
-    ever silently dropped. Missing join matches produce NaN, which is
-    expected for pre-qualifying-era races.
-
-    Returns:
-        Merged DataFrame with one row per driver per race.
+    Status is joined at step 6, before enrichment, so that is_dnf and
+    dnf_type can be computed from the actual status label in enrich_merged().
+    This is the only authoritative source — do not rely on is_dnf flags
+    that were set in clean_data.py.
     """
     log.info("=" * 55)
     log.info("Building merged dataset...")
 
-    # -----------------------------------------------------------------------
-    # Step 1: results — the spine
-    # -----------------------------------------------------------------------
+    # ── Step 1: results spine ───────────────────────────────────────────────
     df = tables["results"].copy()
     log.info("  Spine (results):        %d rows", len(df))
 
-    # -----------------------------------------------------------------------
-    # Step 2: + races
-    # -----------------------------------------------------------------------
+    # ── Step 2: + races ─────────────────────────────────────────────────────
     races_cols = ["raceId", "year", "round", "circuitId", "name", "date",
                   "fp1_date", "fp2_date", "fp3_date", "quali_date", "sprint_date"]
     races_cols = [c for c in races_cols if c in tables["races"].columns]
     df = df.merge(
         tables["races"][races_cols].rename(columns={"name": "race_name"}),
-        on="raceId",
-        how="left",
-        validate="many_to_one",
+        on="raceId", how="left", validate="many_to_one",
     )
     log.info("  After + races:          %d rows", len(df))
 
-    # -----------------------------------------------------------------------
-    # Step 3: + circuits
-    # -----------------------------------------------------------------------
+    # ── Step 3: + circuits ──────────────────────────────────────────────────
     circuit_cols = ["circuitId", "circuitRef", "name", "location", "country", "lat", "lng", "alt"]
     circuit_cols = [c for c in circuit_cols if c in tables["circuits"].columns]
     df = df.merge(
         tables["circuits"][circuit_cols].rename(columns={"name": "circuit_name"}),
-        on="circuitId",
-        how="left",
-        validate="many_to_one",
+        on="circuitId", how="left", validate="many_to_one",
     )
     log.info("  After + circuits:       %d rows", len(df))
 
-    # -----------------------------------------------------------------------
-    # Step 4: + drivers
-    # -----------------------------------------------------------------------
+    # ── Step 4: + drivers ───────────────────────────────────────────────────
     driver_cols = ["driverId", "driverRef", "full_name", "nationality", "dob", "code"]
     driver_cols = [c for c in driver_cols if c in tables["drivers"].columns]
     df = df.merge(
@@ -273,15 +254,11 @@ def build_merged_dataset(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
             "nationality": "driver_nationality",
             "code": "driver_code",
         }),
-        on="driverId",
-        how="left",
-        validate="many_to_one",
+        on="driverId", how="left", validate="many_to_one",
     )
     log.info("  After + drivers:        %d rows", len(df))
 
-    # -----------------------------------------------------------------------
-    # Step 5: + constructors
-    # -----------------------------------------------------------------------
+    # ── Step 5: + constructors ──────────────────────────────────────────────
     constructor_cols = ["constructorId", "constructorRef", "name", "nationality"]
     constructor_cols = [c for c in constructor_cols if c in tables["constructors"].columns]
     df = df.merge(
@@ -289,40 +266,49 @@ def build_merged_dataset(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
             "name": "constructor_name",
             "nationality": "constructor_nationality",
         }),
-        on="constructorId",
-        how="left",
-        validate="many_to_one",
+        on="constructorId", how="left", validate="many_to_one",
     )
     log.info("  After + constructors:   %d rows", len(df))
 
-    # -----------------------------------------------------------------------
-    # Step 5b: + status
-    # -----------------------------------------------------------------------
+    # ── Step 6: + status (label lookup — critical for is_dnf derivation) ───
+    # Only bring in statusId + status label; do not overwrite any results col.
+    status_cols = ["statusId", "status"]
+    status_cols = [c for c in status_cols if c in tables["status"].columns]
+
+    # If results already has a 'status' column (from clean_data.py), drop it
+    # first — the joined label from the status table is authoritative.
+    if "status" in df.columns:
+        df = df.drop(columns=["status"])
+        log.info("  Dropped pre-existing 'status' column from results (will re-join from status table)")
+
     df = df.merge(
-        tables["status"],
-        on="statusId",
-        how="left",
-        validate="many_to_one"
+        tables["status"][status_cols],
+        on="statusId", how="left", validate="many_to_one",
     )
+
+    # Verify no orphan statusIds after the join
+    orphans = df["statusId"].notna() & df["status"].isna()
+    if orphans.sum() > 0:
+        log.warning(
+            "  ⚠ %d results rows have a statusId with no matching label in status table.",
+            orphans.sum(),
+        )
+    else:
+        log.info("  ✓ All statusId values resolved to a status label.")
+
     log.info("  After + status:         %d rows", len(df))
 
-    # -----------------------------------------------------------------------
-    # Step 6: + qualifying (aggregated to one row per driver per race)
-    # -----------------------------------------------------------------------
+    # ── Step 7: + qualifying ────────────────────────────────────────────────
     qual_agg = aggregate_qualifying(tables["qualifying"])
     df = df.merge(qual_agg, on=["raceId", "driverId"], how="left")
     log.info("  After + qualifying:     %d rows", len(df))
 
-    # -----------------------------------------------------------------------
-    # Step 7: + pit stops (aggregated)
-    # -----------------------------------------------------------------------
+    # ── Step 8: + pit stops ─────────────────────────────────────────────────
     pit_agg = aggregate_pit_stops(tables["pit_stops"])
     df = df.merge(pit_agg, on=["raceId", "driverId"], how="left")
     log.info("  After + pit_stops:      %d rows", len(df))
 
-    # -----------------------------------------------------------------------
-    # Step 8: + lap times (aggregated)
-    # -----------------------------------------------------------------------
+    # ── Step 9: + lap times ─────────────────────────────────────────────────
     lap_agg = aggregate_lap_times(tables["lap_times"])
     df = df.merge(lap_agg, on=["raceId", "driverId"], how="left")
     log.info("  After + lap_times:      %d rows", len(df))
@@ -339,19 +325,39 @@ def enrich_merged(df: pd.DataFrame) -> pd.DataFrame:
     Add derived columns that require the fully merged context.
 
     Columns added:
+      is_dnf              : derived from status label via constants.py
+                            (replaces any pre-existing is_dnf flag)
+      dnf_type            : 'mechanical' | 'crash' | 'other' | None
       driver_age_at_race  : driver age in years on race day
-      qualifying_gap_ms   : driver's best_quali_ms minus pole time for that race
-                            (requires all drivers for a race to be present)
+      qualifying_gap_ms   : best_quali_ms minus pole time for that race
       qualifying_gap_pct  : qualifying_gap_ms / pole_time * 100
-      season_round_pct    : round / max_round_in_season  (0–1 progress proxy)
+      season_round_pct    : round / max_round_in_season  (0–1 progress)
     """
     log.info("Enriching merged dataset...")
 
-    # -----------------------------------------------------------------------
-    # Driver age at race
-    # -----------------------------------------------------------------------
+    # ── is_dnf and dnf_type from status label ───────────────────────────────
+    # This is the single authoritative derivation across the pipeline.
+    # build_master_table.py will re-validate this but derives from the same
+    # constants.py classifiers, so results will always be consistent.
+    if "status" in df.columns:
+        log.info("  Deriving is_dnf and dnf_type from status label...")
+        df["is_dnf"]   = compute_is_dnf_series(df["status"])
+        df["dnf_type"] = compute_dnf_type_series(df["status"])
+
+        n_dnf = int(df["is_dnf"].sum())
+        log.info(
+            "  is_dnf: %d DNFs / %d total (%.1f%%)",
+            n_dnf, len(df), n_dnf / len(df) * 100,
+        )
+    else:
+        log.warning(
+            "  'status' column not found after merge — is_dnf cannot be "
+            "derived from status label. Check that status table joined correctly."
+        )
+
+    # ── Driver age at race ──────────────────────────────────────────────────
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["dob"] = pd.to_datetime(df["dob"], errors="coerce")
+    df["dob"]  = pd.to_datetime(df["dob"],  errors="coerce")
 
     has_dob = df["dob"].notna() & df["date"].notna()
     df["driver_age_at_race"] = np.nan
@@ -359,9 +365,7 @@ def enrich_merged(df: pd.DataFrame) -> pd.DataFrame:
         (df.loc[has_dob, "date"] - df.loc[has_dob, "dob"]).dt.days / 365.25
     ).round(2)
 
-    # -----------------------------------------------------------------------
-    # Qualifying gap to pole (requires all drivers for that race)
-    # -----------------------------------------------------------------------
+    # ── Qualifying gap to pole ──────────────────────────────────────────────
     pole_times = (
         df[df["best_quali_ms"].notna()]
         .groupby("raceId")["best_quali_ms"]
@@ -370,14 +374,12 @@ def enrich_merged(df: pd.DataFrame) -> pd.DataFrame:
     )
     df = df.merge(pole_times, on="raceId", how="left")
 
-    df["qualifying_gap_ms"] = (df["best_quali_ms"] - df["pole_quali_ms"]).round(1)
+    df["qualifying_gap_ms"]  = (df["best_quali_ms"] - df["pole_quali_ms"]).round(1)
     df["qualifying_gap_pct"] = (
         (df["qualifying_gap_ms"] / df["pole_quali_ms"]) * 100
     ).round(4)
 
-    # -----------------------------------------------------------------------
-    # Season progress (round / total rounds in that season)
-    # -----------------------------------------------------------------------
+    # ── Season progress ─────────────────────────────────────────────────────
     max_rounds = (
         df.groupby("year")["round"]
         .max()
@@ -394,7 +396,6 @@ def enrich_merged(df: pd.DataFrame) -> pd.DataFrame:
 # Column ordering and final tidy
 # ===========================================================================
 
-# Logical column groups for readability
 _RACE_CONTEXT_COLS = [
     "raceId", "year", "round", "season_round_pct", "race_name",
     "date", "circuitId", "circuit_name", "circuitRef", "location",
@@ -410,7 +411,7 @@ _CONSTRUCTOR_COLS = [
 _RESULT_COLS = [
     "resultId", "grid", "position", "positionText", "positionOrder",
     "points", "laps", "milliseconds", "statusId", "status",
-    "is_dnf", "is_podium",
+    "is_dnf", "dnf_type", "is_podium",
     "fastestLap", "rank", "fastestLapTime_ms", "fastestLapSpeed",
 ]
 _QUALI_COLS = [
@@ -439,10 +440,7 @@ COLUMN_ORDER = (
 
 
 def reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Reorder columns into logical groups; append any unaccounted columns at end.
-    """
-    ordered = [c for c in COLUMN_ORDER if c in df.columns]
+    ordered   = [c for c in COLUMN_ORDER if c in df.columns]
     remainder = [c for c in df.columns if c not in ordered]
     if remainder:
         log.info("  Appending %d unordered columns: %s", len(remainder), remainder)
@@ -460,29 +458,22 @@ def run_merge(
     """
     Full merge pipeline: load -> join -> enrich -> save.
 
-    Args:
-        interim_dir:  data/interim/ containing *_clean.csv files.
-        output_file:  Destination path for cleaned_merged_data.csv.
-
-    Returns:
-        Fully merged and enriched DataFrame.
+    Status is joined as a first-class table so is_dnf and dnf_type are
+    derived from the authoritative label, not from pre-existing flags.
     """
     tables = load_clean_tables(interim_dir)
     df = build_merged_dataset(tables)
     df = enrich_merged(df)
     df = reorder_columns(df)
 
-    # Final null audit
     null_pct_overall = df.isna().mean().mean() * 100
     log.info("Overall null rate in merged dataset: %.1f%%", null_pct_overall)
 
-    # Columns with >50% null — worth noting for feature engineering decisions
     high_null_cols = df.columns[df.isna().mean() > 0.5].tolist()
     if high_null_cols:
         log.warning(
             "  %d columns >50%% null (expected for pre-modern era): %s",
-            len(high_null_cols),
-            high_null_cols,
+            len(high_null_cols), high_null_cols,
         )
 
     output_file.parent.mkdir(parents=True, exist_ok=True)

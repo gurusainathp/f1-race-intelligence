@@ -14,7 +14,8 @@ Writes:
   data/processed/master_race_table.csv   — denormalized table, one row
                                            per driver per race
   data/processed/f1_database.db          — SQLite database containing:
-                                             - all 8 cleaned source tables
+                                             - all 9 cleaned source tables
+                                               (incl. status lookup)
                                              - master_race_table
                                              - 4 analytical views
 
@@ -33,6 +34,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yaml
+
+from constants import (
+    compute_is_dnf_series,
+    compute_dnf_type_series,
+    classify_dnf_type,
+    is_dnf,
+    is_finish,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -70,16 +79,16 @@ DB_FILE           = PROCESSED_DIR / "f1_database.db"
 
 # ---------------------------------------------------------------------------
 # SQL file paths
-# All SQL lives in sql/ as standalone files — Python reads them, never
-# embeds them. This keeps SQL version-controllable and independently runnable.
 # ---------------------------------------------------------------------------
-SCHEMA_SQL_FILE  = SQL_DIR / "schema.sql"
-VIEWS_SQL_FILE   = SQL_DIR / "views.sql"
+SCHEMA_SQL_FILE = SQL_DIR / "schema.sql"
+VIEWS_SQL_FILE  = SQL_DIR / "views.sql"
 
 
 # ---------------------------------------------------------------------------
 # Interim table map
 # Maps SQLite table name -> cleaned CSV filename in data/interim/
+# NOTE: status is intentionally included so SQL queries can join
+# results.statusId -> status.statusId for label lookups.
 # ---------------------------------------------------------------------------
 INTERIM_TABLE_MAP = {
     "circuits":     "circuits_clean.csv",
@@ -90,6 +99,7 @@ INTERIM_TABLE_MAP = {
     "qualifying":   "qualifying_clean.csv",
     "lap_times":    "lap_times_clean.csv",
     "pit_stops":    "pit_stops_clean.csv",
+    "status":       "status_clean.csv",     # ← was missing; needed for label joins
 }
 
 
@@ -97,9 +107,6 @@ INTERIM_TABLE_MAP = {
 # Step 1: Build master_race_table from cleaned_merged_data.csv
 # ===========================================================================
 
-# Final column selection for the master table.
-# Deliberate curation — every column here has either analytical or modelling
-# value. Intermediate join scaffolding (max_round_in_season etc.) is dropped.
 MASTER_TABLE_COLS = [
     # Race context
     "raceId", "year", "round", "season_round_pct",
@@ -129,15 +136,105 @@ MASTER_TABLE_COLS = [
 ]
 
 
+def _recompute_status_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Recompute is_dnf and dnf_type from the 'status' label column.
+
+    This is the authoritative derivation — it uses the shared classifier
+    from constants.py and is independent of whatever flag was set in
+    clean_data.py. It also cross-validates against the pre-existing
+    is_dnf column and logs any discrepancies so data quality issues
+    in upstream cleaning are surfaced immediately.
+
+    Columns written:
+      is_dnf    (int8)  : 1 if driver did not finish, 0 otherwise
+      dnf_type  (str)   : 'mechanical' | 'crash' | 'other' | None
+
+    Requires 'status' column to be present in df. If absent, falls back
+    to the existing is_dnf column and logs a warning.
+    """
+    if "status" not in df.columns:
+        log.warning(
+            "  'status' column not found in merged data. "
+            "is_dnf will NOT be recomputed — using pre-existing flag as-is. "
+            "Ensure merge_data.py joins the status table correctly."
+        )
+        if "dnf_type" not in df.columns:
+            df["dnf_type"] = None
+        return df
+
+    log.info("  Recomputing is_dnf and dnf_type from status label...")
+
+    # ── Recompute from status text ──────────────────────────────────────────
+    is_dnf_recomputed = compute_is_dnf_series(df["status"])
+    dnf_type_recomputed = compute_dnf_type_series(df["status"])
+
+    # ── Cross-validate against pre-existing is_dnf flag ────────────────────
+    if "is_dnf" in df.columns:
+        existing = pd.to_numeric(df["is_dnf"], errors="coerce").fillna(-1).astype(int)
+        recomputed = is_dnf_recomputed.astype(int)
+
+        # Only compare rows where both values are 0 or 1 (skip -1 = was null)
+        comparable = existing.isin([0, 1])
+        mismatches = (existing[comparable] != recomputed[comparable]).sum()
+
+        if mismatches > 0:
+            log.warning(
+                "  ⚠ is_dnf MISMATCH: %d rows differ between "
+                "pre-existing flag (clean_data.py) and status-derived value. "
+                "Status-derived value will be used — review clean_data.py if unexpected.",
+                mismatches,
+            )
+            # Sample the mismatches for debugging
+            mismatch_mask = comparable & (existing != recomputed)
+            sample = df.loc[mismatch_mask, ["raceId", "driverId", "status"]].head(10)
+            log.warning("  Sample mismatched rows:\n%s", sample.to_string(index=False))
+        else:
+            log.info("  ✓ is_dnf cross-validation passed — no discrepancies.")
+
+    # ── Write authoritative values ──────────────────────────────────────────
+    df["is_dnf"]   = is_dnf_recomputed
+    df["dnf_type"] = dnf_type_recomputed
+
+    # ── Status category summary ─────────────────────────────────────────────
+    n_total    = len(df)
+    n_finished = int((~is_dnf_recomputed.astype(bool)).sum())
+    n_dnf      = int(is_dnf_recomputed.sum())
+
+    # Count by dnf_type
+    dnf_type_counts = dnf_type_recomputed.value_counts(dropna=True)
+
+    log.info(
+        "  Status summary: %d finished (%.1f%%), %d DNF (%.1f%%)",
+        n_finished, n_finished / n_total * 100,
+        n_dnf, n_dnf / n_total * 100,
+    )
+    for dtype, count in dnf_type_counts.items():
+        log.info("    DNF type %-12s : %d (%.1f%% of DNFs)", dtype, count, count / n_dnf * 100)
+
+    # Warn if the 'Other' unclassified bucket is unexpectedly large
+    other_dnf = int(dnf_type_counts.get("other", 0))
+    if n_dnf > 0 and other_dnf / n_dnf > 0.25:
+        log.warning(
+            "  ⚠ %.1f%% of DNFs classified as 'other' — "
+            "consider extending MECHANICAL_KEYWORDS or CRASH_KEYWORDS in constants.py",
+            other_dnf / n_dnf * 100,
+        )
+
+    return df
+
+
 def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
     """
     Load cleaned_merged_data.csv and produce the curated master race table.
 
-    Adds these derived columns on top of what merge_data.py already built:
-      grid_vs_finish_delta    : grid - position (positive = gained places)
-      is_points_finish        : 1 if points > 0
-      is_winner               : 1 if position == 1
-      constructor_season_key  : constructorRef_year (era-aware grouping key)
+    Adds derived columns:
+      is_dnf                : recomputed from status label (authoritative)
+      dnf_type              : 'mechanical' | 'crash' | 'other' | None
+      grid_vs_finish_delta  : grid - position (positive = gained places)
+      is_points_finish      : 1 if points > 0
+      is_winner             : 1 if position == 1
+      constructor_season_key: constructorRef_year (era-aware grouping key)
 
     Args:
         merged_path: Path to cleaned_merged_data.csv
@@ -156,33 +253,15 @@ def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
     log.info("  Loaded: %d rows x %d columns", *df.shape)
 
     # -----------------------------------------------------------------------
-    # Derived columns
+    # Status-derived flags (authoritative — replaces clean_data.py flags)
+    # -----------------------------------------------------------------------
+    df = _recompute_status_flags(df)
+
+    # -----------------------------------------------------------------------
+    # Remaining derived columns
     # -----------------------------------------------------------------------
 
-    # DNF Type Classification
-    mechanical_keywords = [
-        "Engine", "Gearbox", "Transmission", "Hydraulics",
-        "Electrical", "Suspension", "Brakes", "Clutch",
-        "Oil leak", "Fuel", "Tyre", "Water leak",
-        "Driveshaft", "Radiator", "Power Unit"
-    ]
-    crash_keywords = [
-        "Accident", "Collision", "Spun off",
-        "Damage", "Collision damage"
-    ]
-
-    def classify_dnf(status: str):
-        if pd.isna(status) or status == "Finished" or status.startswith("+"):
-            return None
-        if any(keyword in status for keyword in mechanical_keywords):
-            return "mechanical"
-        if any(keyword in status for keyword in crash_keywords):
-            return "crash"
-        return "other"
-
-    df["dnf_type"] = df["status"].apply(classify_dnf)
-
-    # grid_vs_finish_delta: positive = gained positions from start to finish.
+    # grid_vs_finish_delta: positive = gained positions from grid to finish.
     # Only populated for classified finishers (position not null).
     df["grid_vs_finish_delta"] = np.where(
         df["grid"].notna() & df["position"].notna(),
@@ -212,8 +291,8 @@ def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
     # Select and order final columns
     # -----------------------------------------------------------------------
     extra_cols = [
-        "grid_vs_finish_delta", "is_points_finish",
-        "is_winner", "constructor_season_key", "dnf_type",
+        "dnf_type", "grid_vs_finish_delta",
+        "is_points_finish", "is_winner", "constructor_season_key",
     ]
     final_cols = [c for c in MASTER_TABLE_COLS if c in df.columns] + extra_cols
 
@@ -267,7 +346,6 @@ def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
 # ===========================================================================
 
 def _read_sql_file(path: Path) -> str:
-    """Read a .sql file and return its contents as a string."""
     if not path.exists():
         raise FileNotFoundError(
             f"SQL file not found: {path}\n"
@@ -286,23 +364,21 @@ def load_tables_to_sqlite(
 
     Steps:
       1. Apply schema from sql/schema.sql  (CREATE TABLE + indexes)
-      2. Load all 8 individual cleaned CSVs from data/interim/
+      2. Load all 9 individual cleaned CSVs (incl. status lookup table)
       3. Load master_race_table
       4. Apply views from sql/views.sql
 
-    The operation is idempotent — safe to re-run. Tables are replaced
-    (if_exists='replace') so re-runs reflect updated data.
+    The status table is a first-class lookup in the DB — SQL queries
+    can now JOIN results.statusId -> status.statusId to get the label,
+    or JOIN master_race_table.statusId -> status.statusId for the same.
 
-    Args:
-        interim_dir: data/interim/ containing *_clean.csv files.
-        master_df:   The built master race table DataFrame.
-        db_path:     Destination path for the .db file.
+    The operation is idempotent — safe to re-run (tables are replaced).
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     log.info("Connected to SQLite: %s", db_path)
 
-    # Step 1: Apply schema DDL from sql/schema.sql
+    # Step 1: Schema DDL
     log.info("Applying schema from %s ...", SCHEMA_SQL_FILE)
     schema_sql = _read_sql_file(SCHEMA_SQL_FILE)
     conn.executescript(schema_sql)
@@ -324,7 +400,7 @@ def load_tables_to_sqlite(
     master_df.to_sql("master_race_table", conn, if_exists="replace", index=False)
     log.info("  Loaded  %-20s  %d rows", "master_race_table", len(master_df))
 
-    # Step 4: Create analytical views from sql/views.sql
+    # Step 4: Analytical views
     log.info("Creating views from %s ...", VIEWS_SQL_FILE)
     views_sql = _read_sql_file(VIEWS_SQL_FILE)
     conn.executescript(views_sql)
@@ -338,8 +414,8 @@ def load_tables_to_sqlite(
 def verify_database(db_path: Path) -> None:
     """
     Run a quick sanity check on the loaded database.
-
     Prints row counts for all tables and confirms views exist.
+    Also verifies status table is present and joinable.
     """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -355,12 +431,42 @@ def verify_database(db_path: Path) -> None:
     print(f"  {'NAME':<35} {'TYPE':<8} {'ROWS':>8}")
     print("-" * 55)
 
+    loaded_tables = set()
     for name, obj_type in tables_and_views:
         if obj_type == "table":
             count = cursor.execute(f"SELECT COUNT(*) FROM [{name}]").fetchone()[0]
             print(f"  {name:<35} {obj_type:<8} {count:>8,}")
+            loaded_tables.add(name)
         else:
             print(f"  {name:<35} {obj_type:<8} {'—':>8}")
+
+    print("=" * 55)
+
+    # Verify status table is present and FK join works
+    if "status" in loaded_tables and "results" in loaded_tables:
+        orphan_check = cursor.execute(
+            "SELECT COUNT(*) FROM results r "
+            "LEFT JOIN status s ON r.statusId = s.statusId "
+            "WHERE s.statusId IS NULL"
+        ).fetchone()[0]
+        if orphan_check == 0:
+            print("  ✓ status FK join: all results.statusId match status table")
+        else:
+            print(f"  ⚠ status FK join: {orphan_check} orphan statusId in results")
+
+        # Show top DNF causes using the actual status table join
+        print("\n  Top 5 DNF causes (from status join):")
+        top_dnf = cursor.execute(
+            "SELECT s.status, COUNT(*) as cnt "
+            "FROM master_race_table m "
+            "JOIN status s ON m.statusId = s.statusId "
+            "WHERE m.is_dnf = 1 "
+            "GROUP BY s.status ORDER BY cnt DESC LIMIT 5"
+        ).fetchall()
+        for label, cnt in top_dnf:
+            print(f"    {label:<30} {cnt:>6,}")
+    else:
+        print("  ⚠ Could not verify status join — table(s) missing")
 
     print("=" * 55)
     conn.close()
@@ -371,47 +477,37 @@ def verify_database(db_path: Path) -> None:
 # ===========================================================================
 
 def run_build_master_table(
-    interim_dir: Path   = INTERIM_DIR,
-    processed_dir: Path = PROCESSED_DIR,
+    interim_dir: Path       = INTERIM_DIR,
+    processed_dir: Path     = PROCESSED_DIR,
     master_table_file: Path = MASTER_TABLE_FILE,
-    db_file: Path       = DB_FILE,
+    db_file: Path           = DB_FILE,
 ) -> pd.DataFrame:
     """
     Full pipeline:
-      1. Build master_race_table.csv from cleaned_merged_data.csv
+      1. Build master_race_table from cleaned_merged_data.csv
+         - Recomputes is_dnf and dnf_type from status label (authoritative)
+         - Cross-validates against pre-existing is_dnf from clean_data.py
       2. Save to data/processed/master_race_table.csv
-      3. Load all tables + master table into SQLite
-      4. Create analytical views from sql/views.sql
-      5. Verify database contents
-
-    Args:
-        interim_dir:        data/interim/
-        processed_dir:      data/processed/
-        master_table_file:  Output path for master_race_table.csv
-        db_file:            Output path for f1_database.db
-
-    Returns:
-        master_race_table as a DataFrame (also saved to CSV and SQLite).
+      3. Load all 9 cleaned tables (incl. status) into SQLite
+      4. Load master_race_table into SQLite
+      5. Create analytical views
+      6. Verify database and status FK join
     """
     processed_dir.mkdir(parents=True, exist_ok=True)
 
-    # ----- Step 1: Build -----
     log.info("=" * 55)
     log.info("STEP 1  Building master race table")
     log.info("=" * 55)
     master_df = build_master_table(MERGED_FILE)
 
-    # ----- Step 2: Save CSV -----
     master_df.to_csv(master_table_file, index=False)
     log.info("Saved -> %s  (%d rows)", master_table_file, len(master_df))
 
-    # ----- Step 3-4: Load SQLite -----
     log.info("=" * 55)
     log.info("STEP 2  Loading tables into SQLite + creating views")
     log.info("=" * 55)
     load_tables_to_sqlite(interim_dir, master_df, db_file)
 
-    # ----- Step 5: Verify -----
     log.info("=" * 55)
     log.info("STEP 3  Verifying database")
     log.info("=" * 55)
@@ -423,7 +519,6 @@ def run_build_master_table(
     log.info("  f1_database.db         -> %s", db_file)
     log.info("  SQL schema             -> %s", SCHEMA_SQL_FILE)
     log.info("  SQL views              -> %s", VIEWS_SQL_FILE)
-    log.info("  SQL queries            -> %s", SQL_DIR / "advanced_queries.sql")
     return master_df
 
 
@@ -442,6 +537,24 @@ def print_master_summary(df: pd.DataFrame) -> None:
     print(f"  Podiums       : {int(df['is_podium'].sum()):,}")
     print(f"  Winners       : {int(df['is_winner'].sum()):,}")
     print(f"  DNFs          : {int(df['is_dnf'].sum()):,}")
+
+    if "dnf_type" in df.columns:
+        print("  DNF breakdown :")
+        for dtype, count in df["dnf_type"].value_counts(dropna=True).items():
+            print(f"    {dtype:<14} : {count:,}")
+
+    if "status" in df.columns:
+        unclassified = df.loc[
+            df["is_dnf"].eq(0) & ~df["status"].apply(
+                lambda s: is_finish(str(s)) if pd.notna(s) else False
+            ),
+            "status"
+        ].value_counts().head(5)
+        if not unclassified.empty:
+            print("  Unclassified status (top 5, neither finish nor DNF):")
+            for label, cnt in unclassified.items():
+                print(f"    {label:<30} : {cnt:,}")
+
     null_pct = df.isna().mean().mean() * 100
     print(f"  Overall null  : {null_pct:.1f}%")
     print("=" * 55)
