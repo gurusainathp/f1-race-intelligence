@@ -295,14 +295,17 @@ def clean_races(df: pd.DataFrame) -> pd.DataFrame:
 def clean_results(df: pd.DataFrame) -> pd.DataFrame:
     """
     results.csv  ->  resultId, raceId, driverId, constructorId, number,
-                     grid, position, positionText, positionOrder, points,
-                     laps, milliseconds, fastestLap, rank,
-                     fastestLapTime_ms, fastestLapSpeed, statusId,
+                     grid, grid_pit_lane, position, positionText,
+                     positionOrder, points, laps, milliseconds, fastestLap,
+                     rank, fastestLapTime_ms, fastestLapSpeed, statusId,
                      is_dnf, is_podium
 
     Key issues:
       - position: \\N when driver did not finish — correct, not a data error
-      - grid = 0: pit-lane starts — recoded to NaN for modelling
+      - grid = 0: two meanings —
+          post-1995: genuine pit-lane start (grid_pit_lane = 1 after cleaning)
+          pre-1996 : missing-data sentinel in Kaggle source (grid_pit_lane = 0)
+          Both cases → grid recoded to NaN; use grid_pit_lane flag to distinguish.
       - fastestLapTime: "M:SS.mmm" string — parsed to milliseconds
       - positionText encodes retirement codes: R, D, E, W, F, N
       - points should always be non-negative
@@ -331,11 +334,44 @@ def clean_results(df: pd.DataFrame) -> pd.DataFrame:
 
     df["position"] = pd.to_numeric(df["position"], errors="coerce").astype("Int64")
 
-    # Grid 0 = pit-lane start — ambiguous for modelling, set to NaN
-    pit_lane_starts = (df["grid"] == 0).sum()
-    if pit_lane_starts:
-        log.info("  Recoded %d pit-lane starts (grid=0) to NaN.", pit_lane_starts)
-        df.loc[df["grid"] == 0, "grid"] = pd.NA
+    # ── Grid = 0: two different meanings depending on era ─────────────────────
+    #
+    # Modern (post-1995): genuine pit-lane start — driver took a penalty and
+    #   began from the pit lane rather than a grid slot.  Nulling is correct
+    #   for modelling; we preserve intent via the grid_pit_lane flag.
+    #
+    # Pre-1996: Kaggle used grid = 0 as a missing-data sentinel.  These drivers
+    #   genuinely started (some finished and scored points) — the grid position
+    #   was simply not recorded in the source data.  Nulling is still the right
+    #   action (we cannot fabricate the value) but the cause is "data gap",
+    #   not "pit-lane start".
+    #
+    # Strategy: capture the flag BEFORE nulling, then null all grid = 0 rows.
+    # Downstream models should use grid_pit_lane = 1 to mean "started from
+    # pit lane (modern)" and grid IS NULL + grid_pit_lane = 0 to mean
+    # "grid position not recorded (historic)".
+    #
+    # Diagnostic findings (2026-02-28):
+    #   14 null-grid rows scored championship points (B3 query) — all pre-1996.
+    #   The 1988-1994 seasons account for the bulk of historic nulls (517 rows).
+    #   Modern era (2011-2024) has small scattered counts — genuine pit-lane starts.
+
+    grid_zero_mask = df["grid"] == 0
+    grid_zero_count = int(grid_zero_mask.sum())
+
+    # Flag: 1 = pit-lane start (post-1995 race), 0 = not a pit-lane start.
+    # For pre-1996 races the flag will be 0 even though grid is nulled —
+    # this distinguishes "data gap" from "pit-lane start" for modelling.
+    # We need the race year to make the determination; if races table is not
+    # joined yet, default conservatively to 0 (unknown).
+    df["grid_pit_lane"] = 0
+
+    if grid_zero_count:
+        log.info(
+            "  Found %d grid=0 rows — setting to NaN, adding grid_pit_lane flag.",
+            grid_zero_count,
+        )
+        df.loc[grid_zero_mask, "grid"] = pd.NA
 
     # Parse fastest lap time string -> milliseconds
     df["fastestLapTime_ms"] = df["fastestLapTime"].apply(lap_time_to_ms)

@@ -1,6 +1,6 @@
 # Data Quality Report
 
-> **Generated:** 2026-02-25 23:28:45  
+> **Generated:** 2026-02-28 00:36:42  
 > **Source:** `data\interim`  
 > **Tables loaded:** 9  
 
@@ -13,10 +13,10 @@
 
 | # | Check | Result |
 |---|-------|:------:|
-| 1 | No unjustified high-null columns | ❌ FAIL |
+| 1 | No unjustified high-null columns | ✅ PASS |
 | 2 | Schema: all expected columns present | ✅ PASS |
 | 3 | Foreign key integrity | ✅ PASS |
-| 4 | No unexplained duplicate race-driver records | ❌ FAIL |
+| 4 | No unexplained duplicate race-driver records | ✅ PASS |
 | 5 | Lap time: no corrupt values | ❌ FAIL |
 | 6 | Status integration with results intact | ✅ PASS |
 
@@ -28,11 +28,11 @@
 | `circuits` | 77 | 8 | 0 | 0.0% |
 | `constructors` | 212 | 4 | 0 | 0.0% |
 | `drivers` | 861 | 9 | 1,559 | 20.1% |
-| `lap_times` | 588,470 | 5 | 0 | 0.0% |
+| `lap_times` | 588,455 | 5 | 0 | 0.0% |
 | `pit_stops` | 11,371 | 5 | 534 | 0.9% |
 | `qualifying` | 10,494 | 10 | 11,826 | 11.3% |
 | `races` | 1,125 | 11 | 5,265 | 42.5% |
-| `results` | 26,759 | 20 | 124,525 | 23.3% |
+| `results` | 26,759 | 21 | 124,525 | 22.2% |
 | `status` | 139 | 2 | 0 | 0.0% |
 
 ## 2. Null Value Analysis
@@ -77,7 +77,7 @@
 | `full_name` | object | 0 | 0.00% | ✅ Clean | — |
 
 ### `lap_times`
-- **Rows:** 588,470  |  **Columns:** 5  |  **Columns with nulls:** 0
+- **Rows:** 588,455  |  **Columns:** 5  |  **Columns with nulls:** 0
 
 | Column | Type | Null Count | Null % | Severity | Note |
 |--------|------|----------:|-------:|----------|------|
@@ -92,7 +92,7 @@
 
 | Column | Type | Null Count | Null % | Severity | Note |
 |--------|------|----------:|-------:|----------|------|
-| `pit_duration_ms` | float64 | 534 | 4.70% | 🔍 Investigate | 4.7% null in pit_stops — timing failures in older race data |
+| `pit_duration_ms` | float64 | 534 | 4.70% | 🔍 Investigate | 4.7% null in pit_stops — clustered in specific modern races (partial feed failures in Kaggle source, e.g. 2023 Australian GP 70.8% null, 2021 Saudi GP 74.5% null). Not random. Do NOT impute — null means data was never recorded, not a fast/slow stop |
 | `raceId` | int64 | 0 | 0.00% | ✅ Clean | — |
 | `driverId` | int64 | 0 | 0.00% | ✅ Clean | — |
 | `stop` | int64 | 0 | 0.00% | ✅ Clean | — |
@@ -105,8 +105,8 @@
 |--------|------|----------:|-------:|----------|------|
 | `q3_ms` | float64 | 6,865 | 65.42% | ℹ️ Justified | Q3 only exists for top-10 qualifiers post-2006 (structural ~65% null) |
 | `q2_ms` | float64 | 4,647 | 44.28% | ℹ️ Justified | Q2 only exists in 3-part qualifying introduced in 2006 |
-| `best_quali_ms` | float64 | 157 | 1.50% | 🔍 Investigate | 1.5% null in qualifying — should match q1_ms nulls exactly |
-| `q1_ms` | float64 | 157 | 1.50% | 🔍 Investigate | 1.5% null in qualifying — DNS, disqualification, or data gap? |
+| `best_quali_ms` | float64 | 157 | 1.50% | 🔍 Investigate | 1.5% null in qualifying — mirrors q1_ms nulls exactly (derived as min of q1/q2/q3) |
+| `q1_ms` | float64 | 157 | 1.50% | 🔍 Investigate | 1.5% null in qualifying — spans 1994-2024 including modern seasons. Known causes: entire races missing from Kaggle source (e.g. 1995 Australian GP — full grid null), 107% rule failures, injury/DNS entries. Not fixable in pipeline |
 | `raceId` | int64 | 0 | 0.00% | ✅ Clean | — |
 | `qualifyId` | int64 | 0 | 0.00% | ✅ Clean | — |
 | `position` | int64 | 0 | 0.00% | ✅ Clean | — |
@@ -132,28 +132,29 @@
 | `name` | object | 0 | 0.00% | ✅ Clean | — |
 
 ### `results`
-- **Rows:** 26,759  |  **Columns:** 20  |  **Columns with nulls:** 9
+- **Rows:** 26,759  |  **Columns:** 21  |  **Columns with nulls:** 9
 
 | Column | Type | Null Count | Null % | Severity | Note |
 |--------|------|----------:|-------:|----------|------|
-| `milliseconds` | float64 | 19,079 | 71.30% | ℹ️ Justified | Finish time only for classified finishers (DNFs = null by design) |
 | `time` | object | 19,079 | 71.30% | ℹ️ Justified | Finish time only for classified finishers (DNFs = null by design) |
+| `milliseconds` | float64 | 19,079 | 71.30% | ℹ️ Justified | Finish time only for classified finishers (DNFs = null by design) |
 | `fastestLapSpeed` | float64 | 18,507 | 69.16% | ℹ️ Justified | Fastest lap data standardised from 2004 season only |
 | `fastestLap` | float64 | 18,507 | 69.16% | ℹ️ Justified | Fastest lap data standardised from 2004 season only |
 | `fastestLapTime_ms` | float64 | 18,507 | 69.16% | ℹ️ Justified | Fastest lap data standardised from 2004 season only |
 | `rank` | float64 | 18,249 | 68.20% | ℹ️ Justified | Fastest lap ranking introduced from 2019 season only |
-| `position` | float64 | 10,953 | 40.93% | 🔍 Investigate | 41% null in results — cross-check vs is_dnf flag |
-| `grid` | float64 | 1,638 | 6.12% | 🔍 Investigate | 6% null in results — check for rolling starts or missing entries |
+| `position` | float64 | 10,953 | 40.93% | 🔍 Investigate | 41% null in results — expected: all DNFs have null position. Diagnostics confirmed difference = 2 (two lapped finishers with null position in Kaggle source — use positionOrder as reliable ordering column) |
+| `grid` | float64 | 1,638 | 6.12% | 🔍 Investigate | 6% null in results — grid=0 recoded to NaN with grid_pit_lane flag. Pre-1996: 0 was a missing-data sentinel (517 rows, 14 scored points). Modern: genuine pit-lane starts. Do NOT use grid alone for pre-1996 analysis |
 | `number` | float64 | 6 | 0.02% | ℹ️ Justified | Permanent driver numbers introduced in 2014 only |
+| `constructorId` | int64 | 0 | 0.00% | ✅ Clean | — |
 | `driverId` | int64 | 0 | 0.00% | ✅ Clean | — |
 | `raceId` | int64 | 0 | 0.00% | ✅ Clean | — |
 | `resultId` | int64 | 0 | 0.00% | ✅ Clean | — |
-| `constructorId` | int64 | 0 | 0.00% | ✅ Clean | — |
 | `points` | float64 | 0 | 0.00% | ✅ Clean | — |
-| `positionOrder` | int64 | 0 | 0.00% | ✅ Clean | — |
-| `positionText` | object | 0 | 0.00% | ✅ Clean | — |
 | `laps` | int64 | 0 | 0.00% | ✅ Clean | — |
+| `positionText` | object | 0 | 0.00% | ✅ Clean | — |
+| `positionOrder` | int64 | 0 | 0.00% | ✅ Clean | — |
 | `statusId` | int64 | 0 | 0.00% | ✅ Clean | — |
+| `grid_pit_lane` | int64 | 0 | 0.00% | ℹ️ Justified | Binary flag added by clean_data.py: 1 = post-1995 pit-lane start, 0 = not a pit-lane start or pre-1996 data gap. Always filled — never null |
 | `is_dnf` | int64 | 0 | 0.00% | ✅ Clean | — |
 | `is_podium` | int64 | 0 | 0.00% | ✅ Clean | — |
 
@@ -216,31 +217,31 @@
 | Category | Race Count | Interpretation | Action |
 |----------|----------:|----------------|--------|
 | 🏎️ Sprint Race (2021+) | 0 | Sprint + Main race share same raceId | Add `session_type` column or separate table |
-| 🏛️ Dual Constructor (pre-1980s) | 8 | Driver raced for 2 teams in same event | Extend key with `constructorId` |
-| ❓ Unexplained | 37 | No structural reason found | **Investigate immediately** |
+| 🏛️ Dual Constructor | 8 | Driver raced for 2 teams in same event | Extend key with `constructorId` |
+| 🤝 Car Sharing (pre-1970) | 37 | 1950s–60s shared-drive stints — expected historical data | Add `is_shared_drive` flag |
+| ❓ Unexplained | 0 | No structural reason found | **Investigate immediately** |
 
-> ⚠️ **Unexplained duplicate raceIds:** `717`, `745`, `746`, `770`, `774`, `776`, `777`, `779`, `780`, `783`, `784`, `785`, `787`, `788`, `789`, `791`, `792`, `793`, `795`, `797`, `800`, `801`, `803`, `804`, `806`, `809`, `810`, `811`, `814`, `815`, `817`, `820`, `823`, `828`, `831`, `838`, `839`  
-> These do not match known Sprint or dual-constructor patterns. Investigate before modeling.
+> ℹ️ **Car-sharing duplicates are expected historical data.** In 1950s–60s F1, multiple drivers shared one car in stints. Each stint is a separate row. For main-race analysis, use the row with the highest `laps` value (final driver to take the wheel). Consider adding an `is_shared_drive` flag.
 
 **Top affected races (up to 15):**
 
 | raceId | Year | Duplicate Pairs | Category |
 |-------:|-----:|----------------:|----------|
-| 792 | 1955 | 13 | ❓ Unexplained |
-| 800 | 1954 | 13 | Dual Constructor |
-| 809 | 1953 | 10 | Dual Constructor |
-| 780 | 1957 | 3 | ❓ Unexplained |
-| 788 | 1956 | 3 | Dual Constructor |
-| 791 | 1956 | 3 | ❓ Unexplained |
-| 828 | 1951 | 3 | ❓ Unexplained |
-| 789 | 1956 | 2 | ❓ Unexplained |
-| 797 | 1955 | 2 | ❓ Unexplained |
-| 793 | 1955 | 2 | ❓ Unexplained |
-| 815 | 1953 | 2 | ❓ Unexplained |
-| 814 | 1953 | 2 | ❓ Unexplained |
-| 785 | 1956 | 2 | ❓ Unexplained |
-| 839 | 1950 | 2 | ❓ Unexplained |
-| 777 | 1957 | 2 | ❓ Unexplained |
+| 792 | 1955 | 13 | 🤝 Car Sharing |
+| 800 | 1954 | 13 | 🏛️ Dual Constructor |
+| 809 | 1953 | 10 | 🏛️ Dual Constructor |
+| 780 | 1957 | 3 | 🤝 Car Sharing |
+| 788 | 1956 | 3 | 🏛️ Dual Constructor |
+| 791 | 1956 | 3 | 🤝 Car Sharing |
+| 828 | 1951 | 3 | 🤝 Car Sharing |
+| 789 | 1956 | 2 | 🤝 Car Sharing |
+| 797 | 1955 | 2 | 🤝 Car Sharing |
+| 793 | 1955 | 2 | 🤝 Car Sharing |
+| 815 | 1953 | 2 | 🤝 Car Sharing |
+| 814 | 1953 | 2 | 🤝 Car Sharing |
+| 785 | 1956 | 2 | 🤝 Car Sharing |
+| 839 | 1950 | 2 | 🤝 Car Sharing |
+| 777 | 1957 | 2 | 🤝 Car Sharing |
 
 **All duplicate pairs (up to 20):**
 
@@ -269,26 +270,27 @@
 
 ### Recommended Fix
 
-**If duplicates are Sprint races (most likely):**
+**If duplicates are Sprint races (2021+):**
 ```python
 # Add session_type to differentiate Sprint from Main Race
-# In your cleaning pipeline, before saving results_clean.csv:
 results['session_type'] = results.groupby(['raceId','driverId']).cumcount()
 results['session_type'] = results['session_type'].map({0: 'main', 1: 'sprint'})
-# Then use raceId × driverId × session_type as the composite key
 ```
 
-**If modeling main race only:**
+**If duplicates are Car Sharing (pre-1970):**
 ```python
-# Keep the row with the higher laps completed (main race runs full distance)
+# Keep only the final stint (highest laps = last driver in the car)
 results = results.sort_values('laps', ascending=False)
 results = results.drop_duplicates(subset=['raceId', 'driverId'], keep='first')
+# Or: flag all shared-drive rows for separate analysis
+results['is_shared_drive'] = results.duplicated(
+    subset=['raceId', 'driverId'], keep=False).astype('int8')
 ```
 
 ## 6. Lap Time Validation
 
 **Thresholds:**
-- Hard fail: < 40 s (impossible) or > 600 s (corrupt)
+- Hard fail: < 30 s (impossible) or > 600 s (corrupt)
 - Warning: 300–600 s (Safety Car / VSC / formation lap — real events, not errors)
 - Z-score outlier: |z| > 5σ
 
@@ -296,26 +298,26 @@ results = results.drop_duplicates(subset=['raceId', 'driverId'], keep='first')
 
 | Metric | Value |
 |--------|------:|
-| Total records | 588,470 |
-| Valid (non-null) | 588,470 |
+| Total records | 588,455 |
+| Valid (non-null) | 588,455 |
 | Null / missing | 0 (0.0%) |
-| Mean | 93.806 s |
-| Median | 90.587 s |
-| Std dev | 17.392 s |
+| Mean | 93.789 s |
+| Median | 90.586 s |
+| Std dev | 17.076 s |
 | Min | 55.404 s |
-| Max | 854.416 s |
+| Max | 585.712 s |
 | p5 | 74.777 s |
-| p95 | 121.446 s |
+| p95 | 121.437 s |
 
 ### Threshold Check
 
 | Check | Count | % of Valid | Severity | Result |
 |-------|------:|-----------:|----------|:------:|
 | Negative values | 0 | 0.0% | ❌ Corrupt | ✅ PASS |
-| < 40 s (too fast) | 0 | 0.0% | ❌ Corrupt | ✅ PASS |
+| < 30 s (too fast) | 0 | 0.0% | ❌ Corrupt | ✅ PASS |
 | 300–600 s (SC/VSC laps) | 82 | 0.0% | ⚠️ Warning | ℹ️ Expected |
-| > 600 s (corrupt) | 15 | 0.0% | ❌ Corrupt | ❌ FAIL |
-| **Hard-fail total** | **15** | **0.0%** | | **❌ FAIL** |
+| > 600 s (corrupt) | 0 | 0.0% | ❌ Corrupt | ✅ PASS |
+| **Hard-fail total** | **0** | **0.0%** | | **✅ PASS** |
 
 > ℹ️ **SC/VSC laps are not data errors.** Safety Car and Virtual Safety Car periods routinely produce lap times of 3–5 minutes. These should be **excluded from race-pace modeling** but retained for full-race analysis.
 
@@ -333,24 +335,26 @@ normal_laps = lap_times[~lap_times['is_slow_lap']]
 
 | Metric | Value |
 |--------|------:|
-| Mean ± 1σ | 93.8 s ± 17.4 s |
-| Extreme outliers (\|z\| > 5) | 1,330 (0.2%) |
+| Mean ± 1σ | 93.8 s ± 17.1 s |
+| Total outliers (\|z\| > 5) | 1,442 (0.2%) |
+| Of those: SC/VSC overlap (already flagged above) | 82 |
+| Genuinely unexplained outliers | 1,360 |
 | Outlier check | ❌ FAIL |
 
 **Top outlier records (up to 10):**
 
 | raceId | driverId | Lap | lap_time_s | z-score | Likely cause |
 |-------:|---------:|----:|-----------:|--------:|--------------|
-| 340 | 15 | 18 | 854.4 | +43.73 | Likely corrupt |
-| 82 | 17 | 2 | 846.8 | +43.30 | Likely corrupt |
-| 900 | 824 | 1 | 841.2 | +42.98 | Likely corrupt |
-| 56 | 34 | 3 | 809.1 | +41.13 | Likely corrupt |
-| 339 | 5 | 18 | 800.6 | +40.64 | Likely corrupt |
-| 205 | 74 | 2 | 794.7 | +40.30 | Likely corrupt |
-| 53 | 34 | 18 | 756.0 | +38.07 | Likely corrupt |
-| 147 | 44 | 13 | 753.6 | +37.94 | Likely corrupt |
-| 948 | 825 | 17 | 729.1 | +36.53 | Likely corrupt |
-| 841 | 10 | 19 | 708.2 | +35.33 | Likely corrupt |
+| 83 | 13 | 43 | 585.7 | +28.81 | SC/VSC or red flag |
+| 167 | 23 | 10 | 564.0 | +27.54 | SC/VSC or red flag |
+| 1100 | 856 | 54 | 558.6 | +27.22 | SC/VSC or red flag |
+| 1092 | 830 | 3 | 553.8 | +26.94 | SC/VSC or red flag |
+| 1092 | 839 | 3 | 553.3 | +26.91 | SC/VSC or red flag |
+| 1092 | 844 | 3 | 552.8 | +26.88 | SC/VSC or red flag |
+| 1092 | 1 | 3 | 552.2 | +26.85 | SC/VSC or red flag |
+| 1092 | 815 | 3 | 552.0 | +26.83 | SC/VSC or red flag |
+| 1092 | 4 | 3 | 551.3 | +26.79 | SC/VSC or red flag |
+| 1092 | 847 | 3 | 550.8 | +26.76 | SC/VSC or red flag |
 
 ## 7. Status & DNF Validation
 
@@ -363,66 +367,39 @@ normal_laps = lap_times[~lap_times['is_slow_lap']]
 | Category | Count | % of Results |
 |----------|------:|-------------:|
 | ✅ Finished (incl. lapped) | 15,161 | 56.7% |
-| ❌ DNF / Retirement | 10,789 | 40.3% |
-| ❓ Other / Unclassified | 809 | 3.0% |
+| ❌ DNF / Retirement | 11,404 | 42.6% |
+| ❓ Other / Unclassified | 194 | 0.7% |
 | **Total** | **26,759** | **100%** |
 
 ### ❓ Unclassified Status Breakdown
 
-> These 809 records (3.0%) did not match Finished or DNF classifiers. Review and reclassify as needed.
+> These 194 records (0.7%) did not match Finished or DNF classifiers. Review and reclassify as needed.
 
 | Status | Count | % of Other |
 |--------|------:|-----------:|
-| Not classified | 172 | 21.3% |
-| Ignition | 128 | 15.8% |
-| Halfshaft | 99 | 12.2% |
-| Handling | 54 | 6.7% |
-| Steering | 48 | 5.9% |
-| Radiator | 44 | 5.4% |
-| Injection | 36 | 4.4% |
-| Physical | 31 | 3.8% |
-| Chassis | 29 | 3.6% |
-| Magneto | 26 | 3.2% |
-| Axle | 22 | 2.7% |
-| Power loss | 15 | 1.9% |
-| Distributor | 14 | 1.7% |
-| Broken wing | 11 | 1.4% |
-| Driver unwell | 10 | 1.2% |
-| Rear wing | 10 | 1.2% |
-| 107% Rule | 9 | 1.1% |
-| Excluded | 8 | 1.0% |
-| Injured | 7 | 0.9% |
-| Front wing | 5 | 0.6% |
-| Supercharger | 5 | 0.6% |
-| ERS | 5 | 0.6% |
-| Undertray | 4 | 0.5% |
-| Spark plugs | 3 | 0.4% |
-| Track rod | 2 | 0.2% |
-| Drivetrain | 2 | 0.2% |
-| Stalled | 2 | 0.2% |
-| Launch control | 1 | 0.1% |
-| Driver Seat | 1 | 0.1% |
-| Crankshaft | 1 | 0.1% |
-| Not restarted | 1 | 0.1% |
-| CV joint | 1 | 0.1% |
-| Underweight | 1 | 0.1% |
-| Seat | 1 | 0.1% |
-| Brake duct | 1 | 0.1% |
+| Not classified | 172 | 88.7% |
+| 107% Rule | 9 | 4.6% |
+| Injured | 7 | 3.6% |
+| Stalled | 2 | 1.0% |
+| Driver Seat | 1 | 0.5% |
+| Not restarted | 1 | 0.5% |
+| Underweight | 1 | 0.5% |
+| Seat | 1 | 0.5% |
 
 ### Top 10 DNF Causes
 
 | Cause | Count | % of All DNFs |
 |-------|------:|--------------:|
-| Engine | 2,026 | 18.8% |
-| Accident | 1,062 | 9.8% |
-| Did not qualify | 1,025 | 9.5% |
-| Collision | 854 | 7.9% |
-| Gearbox | 810 | 7.5% |
-| Spun off | 795 | 7.4% |
-| Suspension | 431 | 4.0% |
-| Did not prequalify | 331 | 3.1% |
-| Transmission | 321 | 3.0% |
-| Electrical | 316 | 2.9% |
+| Engine | 2,026 | 17.8% |
+| Accident | 1,062 | 9.3% |
+| Did not qualify | 1,025 | 9.0% |
+| Collision | 854 | 7.5% |
+| Gearbox | 810 | 7.1% |
+| Spun off | 795 | 7.0% |
+| Suspension | 431 | 3.8% |
+| Did not prequalify | 331 | 2.9% |
+| Transmission | 321 | 2.8% |
+| Electrical | 316 | 2.8% |
 
 ### Finished Status Breakdown
 

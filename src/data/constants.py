@@ -57,25 +57,62 @@ POSITION_TEXT_DNF_CODES: frozenset[str] = frozenset({"R", "D", "E", "W", "F", "N
 # non-starts. Source: full status table from the F1 dataset (~139 categories).
 # ---------------------------------------------------------------------------
 DNF_KEYWORDS: list[str] = [
-    # Mechanical failures (subset — full list in MECHANICAL_KEYWORDS)
-    "engine", "gearbox", "transmission", "hydraulics", "brakes", "clutch",
-    "suspension", "electrical", "oil", "water", "fuel", "tyre", "wheel",
-    "exhaust", "power unit", "turbo", "compressor", "pneumatic", "cooling",
-    "alternator", "electronics", "driveshaft", "differential", "radiator",
-    "vibrations", "battery", "throttle", "fire", "overheating", "ignition",
-    "halfshaft", "handling", "steering", "injection", "chassis", "mechanical",
-    "magneto", "axle", "power loss", "distributor", "broken wing", "rear wing",
-    "front wing", "supercharger", "ers", "undertray", "spark plugs", "track rod",
-    "drivetrain", "crankshaft", "cv joint", "brake duct",
-    # Crashes / incidents
-    "accident", "collision", "spun off", "damage", "puncture",
-    # Driver / team decisions
+    # ── Powertrain ────────────────────────────────────────────────────────────
+    "engine", "gearbox", "transmission", "clutch", "turbo", "compressor",
+    "supercharger", "throttle", "injection", "ignition", "magneto",
+    "spark plugs", "distributor", "launch control", "power unit", "ers",
+    "exhaust", "alternator", "battery", "electronics", "electrical",
+    "vibrations", "pneumatic",
+    # ── Oil system ────────────────────────────────────────────────────────────
+    # NOTE: bare "oil" intentionally kept — catches "oil pressure", "oil pump"
+    # etc.  Do NOT remove; it also matches any future "oil *" status labels.
+    "oil",
+    # ── Fuel system ──────────────────────────────────────────────────────────
+    # NOTE: bare "fuel" catches "fuel pump", "fuel leak", "fuel pressure" etc.
+    # "out of fuel" is matched via this keyword.  See classify_dnf_type() for
+    # the special-case note: some "out of fuel" rows have a finishing position
+    # (driver was classified despite running dry).  is_dnf() correctly returns
+    # True for all of them; the positionText / position columns distinguish
+    # whether the driver was ultimately classified.
+    "fuel",
+    # ── Cooling / water system ────────────────────────────────────────────────
+    "hydraulics", "cooling", "overheating", "radiator",
+    "water",   # catches "water pressure", "water pump", "water pipe", "water leak"
+    "heat shield",
+    # ── Suspension / steering / handling ──────────────────────────────────────
+    "suspension", "steering", "handling", "brakes",
+    # ── Drivetrain / axles ────────────────────────────────────────────────────
+    "driveshaft", "differential", "drivetrain", "halfshaft", "axle",
+    "cv joint", "track rod",
+    # ── Wheels / tyres / body ────────────────────────────────────────────────
+    "tyre",    # catches "tyre" and "tyre puncture"
+    "wheel",   # catches "wheel bearing", "wheel nut", "wheel rim"
+    # ── Structural / aero ─────────────────────────────────────────────────────
+    "chassis", "broken wing", "front wing", "rear wing", "undertray",
+    "brake duct", "crankshaft",
+    # ── Misc mechanical catch-alls ────────────────────────────────────────────
+    "mechanical", "power loss", "fire",   # "fire" also catches "engine fire", "heat shield fire"
+    "technical",                           # generic technical retirement
+    "cooling system",
+    # ── Crashes / incidents ───────────────────────────────────────────────────
+    "accident",          # includes "fatal accident"
+    "collision",         # includes "collision damage"
+    "spun off",
+    "damage",
+    "puncture",
+    # ── Driver / team decisions ───────────────────────────────────────────────
     "retired", "withdrew", "illness", "injury",
-    # Driver physical
+    # ── Driver physical ───────────────────────────────────────────────────────
     "physical", "unwell",
-    # Administrative
+    "eye injury",        # not caught by bare "injury" (different token order)
+    # ── Safety / other retirements ────────────────────────────────────────────
+    "safety belt",
+    "safety concerns",
+    "refuelling",        # pit-lane equipment failure → retirement
+    "fuel rig",
+    # ── Administrative DNF ────────────────────────────────────────────────────
     "disqualified", "did not", "excluded",
-    # Catch-all
+    # ── Debris / environmental ────────────────────────────────────────────────
     "debris", "safety",
 ]
 
@@ -83,35 +120,68 @@ DNF_KEYWORDS: list[str] = [
 # Mechanical DNF sub-classifier
 # Subset of DNF_KEYWORDS that represent purely mechanical/technical causes.
 # Used for dnf_type = "mechanical".
+#
+# Must stay a superset of any mechanical keyword also in DNF_KEYWORDS.
+# When adding a new mechanical keyword to DNF_KEYWORDS, add it here too.
 # ---------------------------------------------------------------------------
 MECHANICAL_KEYWORDS: list[str] = [
-    # Powertrain
-    "engine", "gearbox", "transmission", "clutch", "turbo", "compressor",
-    "supercharger", "throttle", "fuel", "injection", "ignition", "magneto",
+    # ── Powertrain ────────────────────────────────────────────────────────────
+    "engine",          # includes "engine misfire", "engine fire"
+    "gearbox", "transmission", "clutch", "turbo", "compressor",
+    "supercharger", "throttle", "injection", "ignition", "magneto",
     "spark plugs", "distributor", "launch control", "power unit", "ers",
-    # Cooling / fluids
-    "hydraulics", "oil", "water", "cooling", "overheating", "radiator",
-    # Electrical / electronics
+    "exhaust", "vibrations",
+    # ── Oil system ────────────────────────────────────────────────────────────
+    "oil",             # catches "oil leak", "oil pump", "oil pipe", "oil line",
+                       # "oil pressure" — bare keyword intentional, see DNF_KEYWORDS note
+    # ── Fuel system ──────────────────────────────────────────────────────────
+    # NOTE on "out of fuel": some rows with this status have a finishing position
+    # and championship points, meaning the driver was classified despite running
+    # dry (push-start or recovered).  classify_dnf_type() correctly assigns
+    # dnf_type = "mechanical" for all of them; use positionText / position to
+    # determine whether the driver was ultimately a finisher or a DNF.
+    "fuel",            # catches "fuel pump", "fuel leak", "fuel pressure",
+                       # "fuel pipe", "fuel rig", "out of fuel", "fuel system"
+    # ── Cooling / water system ────────────────────────────────────────────────
+    "hydraulics", "cooling", "overheating", "radiator",
+    "water",           # catches "water pressure", "water pump", "water pipe",
+                       # "water leak", "cooling system"
+    "heat shield",
+    "cooling system",
+    # ── Electrical / electronics ─────────────────────────────────────────────
     "electrical", "alternator", "electronics", "battery",
-    # Suspension / steering / handling
+    # ── Suspension / steering / handling ──────────────────────────────────────
     "suspension", "steering", "handling", "brakes",
-    # Drivetrain / axles
+    # ── Drivetrain / axles ────────────────────────────────────────────────────
     "driveshaft", "differential", "drivetrain", "halfshaft", "axle",
     "cv joint", "track rod",
-    # Wheels / tyres / body
-    "tyre", "wheel", "exhaust", "pneumatic",
-    # Structural / aero
+    # ── Wheels / tyres ────────────────────────────────────────────────────────
+    "tyre",            # catches "tyre", "tyre puncture"
+    "wheel",           # catches "wheel bearing", "wheel nut", "wheel rim"
+    "exhaust", "pneumatic",
+    # ── Structural / aero ─────────────────────────────────────────────────────
     "chassis", "broken wing", "front wing", "rear wing", "undertray",
-    "brake duct", "vibrations", "crankshaft",
-    # Misc mechanical catch-alls
-    "mechanical", "power loss", "fire",
+    "brake duct", "crankshaft",
+    # ── Misc mechanical catch-alls ────────────────────────────────────────────
+    "mechanical", "power loss",
+    "fire",            # catches "fire", "engine fire", "heat shield fire"
+    "technical",       # generic technical retirement
+    "safety belt",     # harness failure
+    "refuelling",      # pit equipment failure
+    "fuel rig",
 ]
 
 # ---------------------------------------------------------------------------
 # Crash DNF sub-classifier
 # ---------------------------------------------------------------------------
 CRASH_KEYWORDS: list[str] = [
-    "accident", "collision", "spun off", "damage", "puncture",
+    "accident",        # includes "fatal accident"
+    "collision",       # includes "collision damage"
+    "spun off",
+    "damage",
+    "puncture",
+    "eye injury",      # driver injury from debris/crash
+    "fatal",           # "fatal accident" — belt-and-braces match
 ]
 
 # ---------------------------------------------------------------------------

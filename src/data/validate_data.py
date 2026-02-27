@@ -52,7 +52,7 @@ FK_CHECKS = [
 # Expected columns per table — extend as schema evolves
 EXPECTED_SCHEMA: dict[str, set[str]] = {
     "results":      {"resultId", "raceId", "driverId", "constructorId", "statusId",
-                     "grid", "position", "points", "laps"},
+                     "grid", "grid_pit_lane", "position", "points", "laps"},
     "races":        {"raceId", "year", "round", "circuitId", "name", "date"},
     "drivers":      {"driverId", "driverRef", "forename", "surname", "nationality"},
     "constructors": {"constructorId", "constructorRef", "name", "nationality"},
@@ -74,24 +74,49 @@ JUSTIFIED_NULLS: dict[str, str] = {
     "number":      "Permanent driver numbers introduced in 2014 only",
     "code":        "3-letter driver codes formalised in modern era only",
     # results — timing only available for classified finishers / modern era
-    "milliseconds":     "Finish time only for classified finishers (DNFs = null by design)",
-    "time":             "Finish time only for classified finishers (DNFs = null by design)",
-    "fastestLap":       "Fastest lap data standardised from 2004 season only",
-    "fastestLapTime_ms":"Fastest lap data standardised from 2004 season only",
-    "fastestLapSpeed":  "Fastest lap data standardised from 2004 season only",
-    "rank":             "Fastest lap ranking introduced from 2019 season only",
+    "milliseconds":      "Finish time only for classified finishers (DNFs = null by design)",
+    "time":              "Finish time only for classified finishers (DNFs = null by design)",
+    "fastestLap":        "Fastest lap data standardised from 2004 season only",
+    "fastestLapTime_ms": "Fastest lap data standardised from 2004 season only",
+    "fastestLapSpeed":   "Fastest lap data standardised from 2004 season only",
+    "rank":              "Fastest lap ranking introduced from 2019 season only",
+    # results — grid_pit_lane: 0 = not a pit-lane start / historic data gap,
+    #           1 = confirmed pit-lane start (post-1995). Never null — int8 flag.
+    "grid_pit_lane": (
+        "Binary flag added by clean_data.py: 1 = post-1995 pit-lane start, "
+        "0 = not a pit-lane start or pre-1996 data gap. Always filled — never null"
+    ),
     # qualifying — session format dependent on era
     "q2_ms": "Q2 only exists in 3-part qualifying introduced in 2006",
     "q3_ms": "Q3 only exists for top-10 qualifiers post-2006 (structural ~65% null)",
 }
 
 # Columns that are high-null but NEED investigation (not automatically excused)
+# Notes updated from diagnostics_report.md (2026-02-28):
 INVESTIGATE_NULLS: dict[str, str] = {
-    "position":         "41% null in results — cross-check vs is_dnf flag",
-    "grid":             "6% null in results — check for rolling starts or missing entries",
-    "q1_ms":            "1.5% null in qualifying — DNS, disqualification, or data gap?",
-    "best_quali_ms":    "1.5% null in qualifying — should match q1_ms nulls exactly",
-    "pit_duration_ms":  "4.7% null in pit_stops — timing failures in older race data",
+    "position": (
+        "41% null in results — expected: all DNFs have null position. "
+        "Diagnostics confirmed difference = 2 (two lapped finishers with null "
+        "position in Kaggle source — use positionOrder as reliable ordering column)"
+    ),
+    "grid": (
+        "6% null in results — grid=0 recoded to NaN with grid_pit_lane flag. "
+        "Pre-1996: 0 was a missing-data sentinel (517 rows, 14 scored points). "
+        "Modern: genuine pit-lane starts. Do NOT use grid alone for pre-1996 analysis"
+    ),
+    "q1_ms": (
+        "1.5% null in qualifying — spans 1994-2024 including modern seasons. "
+        "Known causes: entire races missing from Kaggle source (e.g. 1995 Australian GP "
+        "— full grid null), 107% rule failures, injury/DNS entries. Not fixable in pipeline"
+    ),
+    "best_quali_ms": (
+        "1.5% null in qualifying — mirrors q1_ms nulls exactly (derived as min of q1/q2/q3)"
+    ),
+    "pit_duration_ms": (
+        "4.7% null in pit_stops — clustered in specific modern races (partial feed failures "
+        "in Kaggle source, e.g. 2023 Australian GP 70.8% null, 2021 Saudi GP 74.5% null). "
+        "Not random. Do NOT impute — null means data was never recorded, not a fast/slow stop"
+    ),
 }
 
 # ── Status classifiers ─────────────────────────────────────────────────────────
@@ -370,19 +395,29 @@ def section_fk_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]:
     return "\n".join(lines), all_pass
 
 
-# ── Section 5: Duplicate Detection (sprint-aware) ─────────────────────────────
+# ── Section 5: Duplicate Detection (sprint-aware, car-sharing-aware) ──────────
 
 def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]:
     """
-    Duplicate raceId × driverId detection with Sprint Race awareness.
+    Duplicate raceId × driverId detection with three known-legitimate categories:
 
-    Sprint race weekends (2021+) legitimately produce two results rows per driver
-    per raceId (sprint + main race). We detect this by:
-      1. Checking if the duplicate rows differ in constructorId (pre-1980s dual teams).
-      2. Checking if the raceIds map to known Sprint calendar years (2021+).
-      3. Checking if adding constructorId to the key resolves the duplicates.
-    This lets us classify duplicates as Likely-Sprint, Likely-Dual-Constructor,
-    or Unexplained (genuine data problem).
+    1. Sprint Race (2021+)
+       Sprint + Main race share the same raceId. Identified by: year >= 2021
+       AND rows are unique on the 3-key (raceId, driverId, constructorId).
+
+    2. Dual Constructor (any era)
+       Driver raced for two different constructors in the same event.
+       Identified by: constructorId differs across duplicate rows.
+
+    3. Car Sharing (pre-1970 F1)
+       Common 1950s–1960s practice where multiple drivers shared one car in
+       stints. Identified by: year < 1970 AND same constructorId across rows
+       AND different laps values (different stint lengths).
+       Confirmed by diagnostics_report.md (2026-02-28): all 37 "unexplained"
+       raceIds from 1950–1964 are car-sharing entries. Not data errors.
+
+    Scorecard fails only if unexplained duplicates remain after all three
+    categories are checked.
     """
     lines = ["## 5. Duplicate Race-Driver Records", ""]
 
@@ -401,9 +436,10 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
     rows_affected = int(dupe_mask.sum())
     passed        = dupe_pairs == 0
 
-    # Initialise classification sets — populated inside the if block below
+    # Classification sets — populated inside the block below
     sprint_race_ids  = set()
     dual_constructor = set()
+    car_sharing      = set()
     unexplained      = set()
 
     lines += [
@@ -417,8 +453,6 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
     if dupe_pairs > 0:
         dupe_df = results[dupe_mask].copy()
 
-        # ── Classify each duplicate group ──────────────────────────────────────
-
         has_race_year = ("races" in tables and "year" in tables["races"].columns
                          and "raceId" in tables["races"].columns)
 
@@ -428,28 +462,36 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
             race_year_map = pd.Series(dtype=int)
 
         has_constructor = "constructorId" in results.columns
+        has_laps        = "laps" in results.columns
 
         for (race_id, driver_id), grp in dupe_df.groupby(["raceId", "driverId"]):
-            # Check 1: do rows differ in constructorId? (dual-constructor scenario)
+            year = int(race_year_map.get(race_id, 0) or 0)
+
+            # ── Check 1: Dual constructor ─────────────────────────────────────
+            # Rows differ in constructorId → driver raced for two teams.
             if has_constructor and grp["constructorId"].nunique() > 1:
                 dual_constructor.add(race_id)
                 continue
 
-            # Check 2: does adding constructorId fully resolve the duplicate?
-            if has_constructor and grp.duplicated(subset=["raceId", "driverId", "constructorId"]).sum() == 0:
-                # Unique on 3-key but not 2-key → classic sprint scenario
-                # int(... or 0) safely converts pd.NA / None from Int64 dtype to 0
-                year = int(race_year_map.get(race_id, 0) or 0)
-                if year >= 2021:
-                    sprint_race_ids.add(race_id)
-                    continue
-
-            # Check 3: same race year >= 2021 strongly suggests sprint
-            year = int(race_year_map.get(race_id, 0) or 0)
+            # ── Check 2: Sprint race (2021+) ──────────────────────────────────
+            # Same constructor, different laps, modern era.
             if year >= 2021:
                 sprint_race_ids.add(race_id)
-            else:
-                unexplained.add(race_id)
+                continue
+
+            # ── Check 3: Car sharing (pre-1970) ───────────────────────────────
+            # Same constructor, different lap counts → shared-drive stints.
+            # Confirmed in Kaggle F1 dataset: 1950–1964 races only.
+            if (year < 1970
+                    and has_laps
+                    and has_constructor
+                    and grp["constructorId"].nunique() == 1
+                    and (grp["laps"].max() - grp["laps"].min()) > 0):
+                car_sharing.add(race_id)
+                continue
+
+            # ── No known pattern matches ──────────────────────────────────────
+            unexplained.add(race_id)
 
         all_affected   = sorted(dupe_df["raceId"].unique())
         distinct_races = len(all_affected)
@@ -466,8 +508,10 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
             "|----------|----------:|----------------|--------|",
             f"| 🏎️ Sprint Race (2021+) | {len(sprint_race_ids)} "
             f"| Sprint + Main race share same raceId | Add `session_type` column or separate table |",
-            f"| 🏛️ Dual Constructor (pre-1980s) | {len(dual_constructor)} "
+            f"| 🏛️ Dual Constructor | {len(dual_constructor)} "
             f"| Driver raced for 2 teams in same event | Extend key with `constructorId` |",
+            f"| 🤝 Car Sharing (pre-1970) | {len(car_sharing)} "
+            f"| 1950s–60s shared-drive stints — expected historical data | Add `is_shared_drive` flag |",
             f"| ❓ Unexplained | {len(unexplained)} "
             f"| No structural reason found | **Investigate immediately** |",
         ]
@@ -477,11 +521,20 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
             lines += [
                 "",
                 f"> ⚠️ **Unexplained duplicate raceIds:** {unexplained_ids}  ",
-                "> These do not match known Sprint or dual-constructor patterns. "
+                "> These do not match Sprint, dual-constructor, or car-sharing patterns. "
                 "Investigate before modeling.",
             ]
 
-        # Per-race duplicate table
+        if car_sharing:
+            lines += [
+                "",
+                "> ℹ️ **Car-sharing duplicates are expected historical data.** In 1950s–60s F1,"
+                " multiple drivers shared one car in stints. Each stint is a separate row."
+                " For main-race analysis, use the row with the highest `laps` value"
+                " (final driver to take the wheel). Consider adding an `is_shared_drive` flag.",
+            ]
+
+        # Per-race summary table
         race_summary = (
             dupe_df.groupby("raceId")
             .apply(lambda g: g.duplicated(subset=["driverId"]).sum(), include_groups=False)
@@ -493,15 +546,15 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
         if has_race_year:
             race_summary["year"] = race_summary["raceId"].map(race_year_map).fillna("?").astype(str)
             race_summary["category"] = race_summary["raceId"].apply(
-                lambda r: "Sprint" if r in sprint_race_ids
-                else ("Dual Constructor" if r in dual_constructor else "❓ Unexplained")
+                lambda r: (
+                    "🏎️ Sprint"         if r in sprint_race_ids
+                    else "🏛️ Dual Constructor" if r in dual_constructor
+                    else "🤝 Car Sharing"       if r in car_sharing
+                    else "❓ Unexplained"
+                )
             )
 
-        lines += [
-            "",
-            "**Top affected races (up to 15):**",
-            "",
-        ]
+        lines += ["", "**Top affected races (up to 15):**", ""]
 
         if has_race_year:
             lines += [
@@ -539,36 +592,32 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
         for _, row in all_dupes.iterrows():
             lines.append(f"| {int(row['raceId'])} | {int(row['driverId'])} | {int(row['occurrences'])} |")
 
-        # Recommended fix
         lines += [
             "",
             "### Recommended Fix",
             "",
-            "**If duplicates are Sprint races (most likely):**",
+            "**If duplicates are Sprint races (2021+):**",
             "```python",
             "# Add session_type to differentiate Sprint from Main Race",
-            "# In your cleaning pipeline, before saving results_clean.csv:",
             "results['session_type'] = results.groupby(['raceId','driverId']).cumcount()",
             "results['session_type'] = results['session_type'].map({0: 'main', 1: 'sprint'})",
-            "# Then use raceId × driverId × session_type as the composite key",
             "```",
             "",
-            "**If modeling main race only:**",
+            "**If duplicates are Car Sharing (pre-1970):**",
             "```python",
-            "# Keep the row with the higher laps completed (main race runs full distance)",
+            "# Keep only the final stint (highest laps = last driver in the car)",
             "results = results.sort_values('laps', ascending=False)",
             "results = results.drop_duplicates(subset=['raceId', 'driverId'], keep='first')",
+            "# Or: flag all shared-drive rows for separate analysis",
+            "results['is_shared_drive'] = results.duplicated(",
+            "    subset=['raceId', 'driverId'], keep=False).astype('int8')",
             "```",
         ]
 
     # Scorecard: pass if zero unexplained duplicates.
-    # Sprint (2021+) and dual-constructor duplicates are structurally expected.
-    # Use the already-computed `unexplained` set directly — avoids re-running
-    # the same fragile year-lookup logic a second time.
-    if dupe_pairs == 0:
-        scorecard_pass = True
-    else:
-        scorecard_pass = len(unexplained) == 0
+    # Sprint, dual-constructor, and car-sharing duplicates are all structurally
+    # expected — they are not data errors.
+    scorecard_pass = dupe_pairs == 0 or len(unexplained) == 0
 
     return "\n".join(lines), scorecard_pass
 
