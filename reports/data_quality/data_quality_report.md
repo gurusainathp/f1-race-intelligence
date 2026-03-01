@@ -1,15 +1,17 @@
 # Data Quality Report
 
-> **Generated:** 2026-03-01 17:14:06  
-> **Source:** `data\interim`  
+> **Generated:** 2026-03-02 00:51:32  
+> **Source (raw):** `data\interim`  
+> **Source (features):** `data\processed`  
 > **Tables loaded:** 9  
+> **Feature tables loaded:** 3 / 3  
 
 ────────────────────────────────────────────────────────────
 
 
 ## 0. Quality Scorecard
 
-**Overall:** ✅ PASS
+**Overall:** ❌ FAIL
 
 | # | Check | Result |
 |---|-------|:------:|
@@ -19,6 +21,9 @@
 | 4 | No unexplained duplicate race-driver records | ✅ PASS |
 | 5 | Lap time: no corrupt values | ✅ PASS |
 | 6 | Status integration with results intact | ✅ PASS |
+| 7 | Feature tables: no duplicate composite keys | ❌ FAIL |
+| 8 | Feature values: no impossible values (FAIL checks) | ✅ PASS |
+| 9 | Points reconciliation: no season delta > 5 pts | ✅ PASS |
 
 
 ## 1. Dataset Inventory
@@ -157,7 +162,7 @@
 | `grid_pit_lane` | int64 | 0 | 0.00% | ℹ️ Justified | Binary flag: 1 = post-1995 pit-lane start, 0 = not a pit-lane start or pre-1996 data gap. Always filled — never null |
 | `is_dnf` | int64 | 0 | 0.00% | ✅ Clean | — |
 | `is_podium` | int64 | 0 | 0.00% | ✅ Clean | — |
-| `is_shared_drive` | int64 | 0 | 0.00% | ℹ️ Justified | Binary flag: 1 = pre-1970 car-sharing entry (1950s-60s shared-drive stints). All duplicates confirmed as 1950-1964 races. Always filled — never null |
+| `is_shared_drive` | int64 | 0 | 0.00% | ✅ Clean | — |
 
 ### `status`
 - **Rows:** 139  |  **Columns:** 2  |  **Columns with nulls:** 0
@@ -188,7 +193,7 @@
 | `drivers` | — | `code`, `dob`, `full_name`, `number` | ✅ PASS |
 | `lap_times` | — | — | ✅ PASS |
 | `races` | — | `fp1_date`, `fp2_date`, `fp3_date`, `quali_date`, `sprint_date` | ✅ PASS |
-| `results` | — | `fastestLap`, `fastestLapSpeed`, `fastestLapTime_ms`, `is_dnf`, `is_podium`, `milliseconds`, `number`, `positionOrder`, `positionText`, `rank`, `time` | ✅ PASS |
+| `results` | — | `fastestLap`, `fastestLapSpeed`, `fastestLapTime_ms`, `is_dnf`, `is_podium`, `is_shared_drive`, `milliseconds`, `number`, `positionOrder`, `positionText`, `rank`, `time` | ✅ PASS |
 | `status` | — | — | ✅ PASS |
 
 > _Unexpected columns are informational only and do not fail this check._
@@ -207,7 +212,7 @@
 ## 5. Duplicate Race-Driver Records
 
 **Composite key:** `raceId × driverId`
-**Duplicate pairs found:** 91  →  ❌ FAIL
+**Duplicate pairs found:** 91
 **Rows affected:** 176 / 26,759 (0.7%)
 
 **Distinct races affected:** 42
@@ -215,78 +220,92 @@
 
 ### Duplicate Root Cause Classification
 
-| Category | Race Count | Interpretation | Action |
-|----------|----------:|----------------|--------|
-| 🏎️ Sprint Race (2021+) | 0 | Sprint + Main race share same raceId | Add `session_type` column or separate table |
-| 🏛️ Dual Constructor | 8 | Driver raced for 2 teams in same event | Extend key with `constructorId` |
-| 🤝 Car Sharing (pre-1970) | 37 | 1950s–60s shared-drive stints — expected historical data | Add `is_shared_drive` flag |
-| ❓ Unexplained | 0 | No structural reason found | **Investigate immediately** |
+| Category | Pairs | Interpretation | Scorecard |
+|----------|------:|----------------|:---------:|
+| 🏛️ Dual Constructor | 16 | Driver raced for 2 teams in same event — expected | ✅ Ignored |
+| 🤝 Shared Drive | 69 | Same team but different laps/position — expected | ✅ Ignored |
+| ❓ Unexplained | 0 | No structural reason found | ✅ None |
 
-> ℹ️ **Car-sharing duplicates are expected historical data.** In 1950s–60s F1, multiple drivers shared one car in stints. Each stint is a separate row. For main-race analysis, use the row with the highest `laps` value (final driver to take the wheel). Consider adding an `is_shared_drive` flag.
+> ℹ️ **Shared-drive duplicates are expected.** Multiple drivers shared one car in stints, producing different laps/position values for the same raceId×driverId pair.
 
 **Top affected races (up to 15):**
 
-| raceId | Year | Duplicate Pairs | Category |
-|-------:|-----:|----------------:|----------|
-| 792 | 1955 | 13 | 🤝 Car Sharing |
-| 800 | 1954 | 13 | 🏛️ Dual Constructor |
-| 809 | 1953 | 10 | 🏛️ Dual Constructor |
-| 780 | 1957 | 3 | 🤝 Car Sharing |
-| 788 | 1956 | 3 | 🏛️ Dual Constructor |
-| 791 | 1956 | 3 | 🤝 Car Sharing |
-| 828 | 1951 | 3 | 🤝 Car Sharing |
-| 789 | 1956 | 2 | 🤝 Car Sharing |
-| 797 | 1955 | 2 | 🤝 Car Sharing |
-| 793 | 1955 | 2 | 🤝 Car Sharing |
-| 815 | 1953 | 2 | 🤝 Car Sharing |
-| 814 | 1953 | 2 | 🤝 Car Sharing |
-| 785 | 1956 | 2 | 🤝 Car Sharing |
-| 839 | 1950 | 2 | 🤝 Car Sharing |
-| 777 | 1957 | 2 | 🤝 Car Sharing |
+| raceId | Dual Constructor | Shared Drive | Unexplained |
+|-------:|----------------:|-------------:|------------:|
+| 800 | 4 | 8 | 0 |
+| 792 | 0 | 10 | 0 |
+| 809 | 6 | 2 | 0 |
+| 791 | 0 | 3 | 0 |
+| 788 | 1 | 2 | 0 |
+| 828 | 0 | 3 | 0 |
+| 780 | 0 | 3 | 0 |
+| 777 | 0 | 2 | 0 |
+| 785 | 0 | 2 | 0 |
+| 797 | 0 | 2 | 0 |
+| 839 | 0 | 2 | 0 |
+| 789 | 0 | 2 | 0 |
+| 814 | 0 | 2 | 0 |
+| 815 | 0 | 2 | 0 |
+| 793 | 0 | 2 | 0 |
 
-**All duplicate pairs (up to 20):**
+**All duplicate pairs:**
 
-| raceId | driverId | Occurrences |
-|-------:|---------:|------------:|
-| 809 | 521 | 3 |
-| 800 | 612 | 3 |
-| 792 | 427 | 3 |
-| 792 | 554 | 3 |
-| 792 | 501 | 3 |
-| 809 | 612 | 3 |
-| 766 | 541 | 2 |
-| 746 | 475 | 2 |
-| 774 | 566 | 2 |
-| 776 | 581 | 2 |
-| 777 | 501 | 2 |
-| 777 | 578 | 2 |
-| 779 | 356 | 2 |
-| 780 | 475 | 2 |
-| 780 | 479 | 2 |
-| 770 | 479 | 2 |
-| 540 | 229 | 2 |
-| 717 | 373 | 2 |
-| 733 | 465 | 2 |
-| 742 | 475 | 2 |
+| raceId | driverId | Category |
+|-------:|---------:|----------|
+| 540 | 229 | 🏛️ Dual Constructor |
+| 717 | 373 | 🤝 Shared Drive |
+| 733 | 465 | 🏛️ Dual Constructor |
+| 742 | 475 | 🏛️ Dual Constructor |
+| 745 | 418 | 🤝 Shared Drive |
+| 746 | 475 | 🤝 Shared Drive |
+| 766 | 541 | 🏛️ Dual Constructor |
+| 770 | 479 | 🤝 Shared Drive |
+| 774 | 566 | 🤝 Shared Drive |
+| 776 | 581 | 🤝 Shared Drive |
+| 777 | 501 | 🤝 Shared Drive |
+| 777 | 578 | 🤝 Shared Drive |
+| 779 | 356 | 🤝 Shared Drive |
+| 780 | 475 | 🤝 Shared Drive |
+| 780 | 479 | 🤝 Shared Drive |
+| 780 | 581 | 🤝 Shared Drive |
+| 783 | 501 | 🤝 Shared Drive |
+| 784 | 579 | 🤝 Shared Drive |
+| 785 | 579 | 🤝 Shared Drive |
+| 785 | 608 | 🤝 Shared Drive |
+| 787 | 475 | 🤝 Shared Drive |
+| 788 | 475 | 🤝 Shared Drive |
+| 788 | 501 | 🤝 Shared Drive |
+| 788 | 624 | 🏛️ Dual Constructor |
+| 789 | 581 | 🤝 Shared Drive |
+| 789 | 606 | 🤝 Shared Drive |
+| 791 | 554 | 🤝 Shared Drive |
+| 791 | 579 | 🤝 Shared Drive |
+| 791 | 608 | 🤝 Shared Drive |
+| 792 | 427 | 🤝 Shared Drive |
+| 792 | 475 | 🤝 Shared Drive |
+| 792 | 496 | 🤝 Shared Drive |
+| 792 | 501 | 🤝 Shared Drive |
+| 792 | 554 | 🤝 Shared Drive |
+| 792 | 577 | 🤝 Shared Drive |
+| 792 | 633 | 🤝 Shared Drive |
+| 792 | 642 | 🤝 Shared Drive |
+| 792 | 644 | 🤝 Shared Drive |
+| 792 | 648 | 🤝 Shared Drive |
+| 793 | 554 | 🤝 Shared Drive |
+| 793 | 607 | 🤝 Shared Drive |
+| 795 | 554 | 🤝 Shared Drive |
+| 797 | 501 | 🤝 Shared Drive |
+| 797 | 608 | 🤝 Shared Drive |
+| 800 | 509 | 🤝 Shared Drive |
+| 800 | 518 | 🤝 Shared Drive |
+| 800 | 529 | 🤝 Shared Drive |
+| 800 | 556 | 🏛️ Dual Constructor |
+| 800 | 593 | 🤝 Shared Drive |
+| 800 | 611 | 🤝 Shared Drive |
+_(showing first 50 of 85 pairs)_
 
 ### Recommended Fix
-
-**If duplicates are Sprint races (2021+):**
-```python
-# Add session_type to differentiate Sprint from Main Race
-results['session_type'] = results.groupby(['raceId','driverId']).cumcount()
-results['session_type'] = results['session_type'].map({0: 'main', 1: 'sprint'})
-```
-
-**If duplicates are Car Sharing (pre-1970):**
-```python
-# Keep only the final stint (highest laps = last driver in the car)
-results = results.sort_values('laps', ascending=False)
-results = results.drop_duplicates(subset=['raceId', 'driverId'], keep='first')
-# Or: flag all shared-drive rows for separate analysis
-results['is_shared_drive'] = results.duplicated(
-    subset=['raceId', 'driverId'], keep=False).astype('int8')
-```
+**Overall:** ✅ PASS
 
 ## 6. Lap Time Validation
 
@@ -320,23 +339,16 @@ results['is_shared_drive'] = results.duplicated(
 | > 600 s (corrupt) | 0 | 0.0% | ❌ Corrupt | ✅ PASS |
 | **Hard-fail total** | **0** | **0.0%** | | **✅ PASS** |
 
-> ℹ️ **SC/VSC laps are not data errors.** Safety Car and Virtual Safety Car periods routinely produce lap times of 3–5 minutes. These should be **excluded from race-pace modeling** but retained for full-race analysis.
+> ℹ️ **SC/VSC laps are not data errors.** Safety Car and Virtual Safety Car periods routinely produce lap times of 3–5 minutes.
 
-**Recommended handling in pipeline:**
 ```python
-# Flag SC/VSC laps rather than dropping them
 lap_times['is_slow_lap'] = lap_times['lap_time_ms'] > 300000
-# Use only normal laps for pace analysis
 normal_laps = lap_times[~lap_times['is_slow_lap']]
 ```
 
 ### Statistical Outlier Detection (Z-Score) — Advisory
 
-> Flags lap times where |z| > 5 (more than 5 standard deviations from the mean).
-> **This check is advisory and does not affect the scorecard.**
-> A global z-score across 70+ circuits and 75 seasons will always flag
-> SC/VSC slow laps. The hard corruption threshold (> 600 s) above is the
-> authoritative data-quality check.
+> Flags lap times where |z| > 5. Advisory only — does not affect scorecard.
 
 | Metric | Value |
 |--------|------:|
@@ -438,6 +450,167 @@ normal_laps = lap_times[~lap_times['is_slow_lap']]
 | +42 Laps | 1 | 0.0% |
 | +46 Laps | 1 | 0.0% |
 | +20 Laps | 1 | 0.0% |
+
+## 8. Feature Table — Duplicate Key Check
+
+| Table | Key Columns | Rows | Duplicate Pairs | Unexplained | Result |
+|-------|-------------|-----:|----------------:|------------:|:------:|
+| `driver_race` | `raceId`, `driverId` | 26,759 | 91 | 69 | ❌ FAIL |
+
+**`driver_race` duplicate classification** (91 pairs total):
+
+| Category | Pairs | Interpretation | Scorecard |
+|----------|------:|----------------|:---------:|
+| 🏛️ Dual Constructor | 16 | Driver raced for 2 teams in same event — expected | ✅ Ignored |
+| 🤝 Shared Drive | 0 | Same team but different laps/position — expected | ✅ Ignored |
+| ❓ Unexplained | 69 | No structural reason found | ❌ FAIL |
+
+**Unexplained duplicate rows in `driver_race` (up to 10):**
+
+| raceId | driverId | constructorId | (other columns) |
+|-------:|---------:|--------------:|-----------------|
+| 717 | 373 | 172 | _(see parquet for full row)_ |
+| 717 | 373 | 172 | _(see parquet for full row)_ |
+| 745 | 418 | 172 | _(see parquet for full row)_ |
+| 745 | 418 | 172 | _(see parquet for full row)_ |
+| 746 | 475 | 170 | _(see parquet for full row)_ |
+| 746 | 475 | 170 | _(see parquet for full row)_ |
+| 770 | 479 | 118 | _(see parquet for full row)_ |
+| 770 | 479 | 118 | _(see parquet for full row)_ |
+| 774 | 566 | 105 | _(see parquet for full row)_ |
+| 774 | 566 | 105 | _(see parquet for full row)_ |
+
+| `driver_season` | `driverId`, `race_year` | 3,211 | 0 | 0 | ✅ PASS |
+| `constructor_season` | `constructorId`, `race_year` | 1,111 | 0 | 0 | ✅ PASS |
+
+**Overall:** ❌ FAIL
+
+> ℹ️ For `driver_race`, dual-constructor and shared-drive duplicates are structurally expected (mirrors Section 5 logic). Only unexplained duplicates fail the scorecard.
+
+## 9. Feature Value Bounds Check
+
+| Table | Column | Check | Violations | Severity | Result |
+|-------|--------|-------|----------:|:--------:|:------:|
+| `constructor_season` | `dnf_rate` | `dnf_rate` < 0 | 0 | ❌ FAIL | ✅ PASS |
+| `constructor_season` | `dnf_rate` | `dnf_rate` > 1 | 0 | ❌ FAIL | ✅ PASS |
+| `constructor_season` | `win_rate` | `win_rate` > 1 | 0 | ❌ FAIL | ✅ PASS |
+| `constructor_season` | `driver_count` | `driver_count` < 1 | 0 | ❌ FAIL | ✅ PASS |
+| `constructor_season` | `driver_spread_avg_finish` | `driver_spread_avg_finish` < 0 | 0 | ⚠️ WARN | ✅ PASS |
+| `constructor_season` | `driver_spread_total_points` | `driver_spread_total_points` < 0 | 0 | ⚠️ WARN | ✅ PASS |
+| `driver_race` | `grid` | `grid` < 0 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race` | `finish_position` | `finish_position` < 1 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race` | `positions_gained` | `positions_gained` < -30 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race` | `positions_gained` | `positions_gained` > 33 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race` | `points` | `points` < 0 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race` | `pit_stop_count` | `pit_stop_count` < 0 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race` | `avg_pit_duration_ms` | `avg_pit_duration_ms` < 0 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race` | `is_dnf` | `is_dnf` < 0 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race` | `is_dnf` | `is_dnf` > 1 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_season` | `dnf_rate` | `dnf_rate` < 0 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_season` | `dnf_rate` | `dnf_rate` > 1 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_season` | `win_rate` | `win_rate` > 1 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_season` | `podium_rate` | `podium_rate` > 1 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_season` | `races_entered` | `races_entered` < 1 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_season` | `avg_finish_position` | `avg_finish_position` < 1 | 0 | ❌ FAIL | ✅ PASS |
+
+**Overall (FAIL-severity checks only):** ✅ PASS
+
+> _WARN-severity violations are advisory and do not affect the scorecard._
+
+## 10. Points Reconciliation — Driver vs Constructor Totals
+
+**Tolerance bands:**  PASS ≤ 2.0 pts  |  WARN ≤ 5.0 pts  |  FAIL > 5.0 pts
+
+### Season-Level Summary
+
+| Outcome | Seasons | % of Seasons |
+|---------|--------:|-------------:|
+| ✅ PASS (delta ≤ 2.0) | 75 | 100.0% |
+| ⚠️ WARN (2.0 < delta ≤ 5.0) | 0 | 0.0% |
+| ❌ FAIL (delta > 5.0) | 0 | 0.0% |
+
+**Scorecard result:** ✅ PASS  _(fails only on delta > 5.0)_
+
+### Per-Season Detail
+
+| Season | Driver Total | Constructor Total | Delta | Result |
+|-------:|-------------:|------------------:|------:|:------:|
+| 1950 | 168.0 | 168.0 | 0.0 | ✅ PASS |
+| 1951 | 192.0 | 192.0 | 0.0 | ✅ PASS |
+| 1952 | 192.0 | 192.0 | 0.0 | ✅ PASS |
+| 1953 | 216.0 | 216.0 | 0.0 | ✅ PASS |
+| 1954 | 215.6 | 215.6 | 0.0 | ✅ PASS |
+| 1955 | 168.0 | 168.0 | 0.0 | ✅ PASS |
+| 1956 | 192.0 | 192.0 | 0.0 | ✅ PASS |
+| 1957 | 192.0 | 192.0 | 0.0 | ✅ PASS |
+| 1958 | 259.0 | 259.0 | 0.0 | ✅ PASS |
+| 1959 | 216.0 | 216.0 | 0.0 | ✅ PASS |
+| 1960 | 236.0 | 236.0 | 0.0 | ✅ PASS |
+| 1961 | 200.0 | 200.0 | 0.0 | ✅ PASS |
+| 1962 | 225.0 | 225.0 | 0.0 | ✅ PASS |
+| 1963 | 246.0 | 246.0 | 0.0 | ✅ PASS |
+| 1964 | 250.0 | 250.0 | 0.0 | ✅ PASS |
+| 1965 | 250.0 | 250.0 | 0.0 | ✅ PASS |
+| 1966 | 221.0 | 221.0 | 0.0 | ✅ PASS |
+| 1967 | 275.0 | 275.0 | 0.0 | ✅ PASS |
+| 1968 | 298.0 | 298.0 | 0.0 | ✅ PASS |
+| 1969 | 275.0 | 275.0 | 0.0 | ✅ PASS |
+| 1970 | 324.0 | 324.0 | 0.0 | ✅ PASS |
+| 1971 | 275.0 | 275.0 | 0.0 | ✅ PASS |
+| 1972 | 300.0 | 300.0 | 0.0 | ✅ PASS |
+| 1973 | 375.0 | 375.0 | 0.0 | ✅ PASS |
+| 1974 | 375.0 | 375.0 | 0.0 | ✅ PASS |
+| 1975 | 325.0 | 325.0 | 0.0 | ✅ PASS |
+| 1976 | 400.0 | 400.0 | 0.0 | ✅ PASS |
+| 1977 | 425.0 | 425.0 | 0.0 | ✅ PASS |
+| 1978 | 400.0 | 400.0 | 0.0 | ✅ PASS |
+| 1979 | 375.0 | 375.0 | 0.0 | ✅ PASS |
+| 1980 | 350.0 | 350.0 | 0.0 | ✅ PASS |
+| 1981 | 375.0 | 375.0 | 0.0 | ✅ PASS |
+| 1982 | 399.0 | 399.0 | 0.0 | ✅ PASS |
+| 1983 | 369.0 | 369.0 | 0.0 | ✅ PASS |
+| 1984 | 383.5 | 383.5 | 0.0 | ✅ PASS |
+| 1985 | 400.0 | 400.0 | 0.0 | ✅ PASS |
+| 1986 | 400.0 | 400.0 | 0.0 | ✅ PASS |
+| 1987 | 398.0 | 398.0 | 0.0 | ✅ PASS |
+| 1988 | 400.0 | 400.0 | 0.0 | ✅ PASS |
+| 1989 | 400.0 | 400.0 | 0.0 | ✅ PASS |
+| 1990 | 400.0 | 400.0 | 0.0 | ✅ PASS |
+| 1991 | 403.0 | 403.0 | 0.0 | ✅ PASS |
+| 1992 | 416.0 | 416.0 | 0.0 | ✅ PASS |
+| 1993 | 416.0 | 416.0 | 0.0 | ✅ PASS |
+| 1994 | 416.0 | 416.0 | 0.0 | ✅ PASS |
+| 1995 | 442.0 | 442.0 | 0.0 | ✅ PASS |
+| 1996 | 416.0 | 416.0 | 0.0 | ✅ PASS |
+| 1997 | 442.0 | 442.0 | 0.0 | ✅ PASS |
+| 1998 | 416.0 | 416.0 | 0.0 | ✅ PASS |
+| 1999 | 416.0 | 416.0 | 0.0 | ✅ PASS |
+| 2000 | 442.0 | 442.0 | 0.0 | ✅ PASS |
+| 2001 | 442.0 | 442.0 | 0.0 | ✅ PASS |
+| 2002 | 442.0 | 442.0 | 0.0 | ✅ PASS |
+| 2003 | 624.0 | 624.0 | 0.0 | ✅ PASS |
+| 2004 | 702.0 | 702.0 | 0.0 | ✅ PASS |
+| 2005 | 738.0 | 738.0 | 0.0 | ✅ PASS |
+| 2006 | 702.0 | 702.0 | 0.0 | ✅ PASS |
+| 2007 | 663.0 | 663.0 | 0.0 | ✅ PASS |
+| 2008 | 702.0 | 702.0 | 0.0 | ✅ PASS |
+| 2009 | 643.5 | 643.5 | 0.0 | ✅ PASS |
+| 2010 | 1,919.0 | 1,919.0 | 0.0 | ✅ PASS |
+| 2011 | 1,919.0 | 1,919.0 | 0.0 | ✅ PASS |
+| 2012 | 2,020.0 | 2,020.0 | 0.0 | ✅ PASS |
+| 2013 | 1,919.0 | 1,919.0 | 0.0 | ✅ PASS |
+| 2014 | 2,020.0 | 2,020.0 | 0.0 | ✅ PASS |
+| 2015 | 1,919.0 | 1,919.0 | 0.0 | ✅ PASS |
+| 2016 | 2,121.0 | 2,121.0 | 0.0 | ✅ PASS |
+| 2017 | 2,020.0 | 2,020.0 | 0.0 | ✅ PASS |
+| 2018 | 2,121.0 | 2,121.0 | 0.0 | ✅ PASS |
+| 2019 | 2,140.0 | 2,140.0 | 0.0 | ✅ PASS |
+| 2020 | 1,734.0 | 1,734.0 | 0.0 | ✅ PASS |
+| 2021 | 2,189.5 | 2,189.5 | 0.0 | ✅ PASS |
+| 2022 | 2,242.0 | 2,242.0 | 0.0 | ✅ PASS |
+| 2023 | 2,242.0 | 2,242.0 | 0.0 | ✅ PASS |
+| 2024 | 2,443.0 | 2,443.0 | 0.0 | ✅ PASS |
+> ℹ️ **WARN seasons are advisory.** Small deltas (2–5 pts) are common in pre-1980 seasons due to car-sharing and dropped-scores rules. They do not affect model accuracy for post-1990 analysis.
 
 
 ────────────────────────────────────────────────────────────

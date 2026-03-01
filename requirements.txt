@@ -23,6 +23,7 @@ kagglehub
 
 # Utilities
 pyyaml
+pyarrow
 joblib
 tqdm
 

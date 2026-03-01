@@ -39,7 +39,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from src.config import CONFIG
 DB_PATH     = Path(CONFIG["paths"]["processed_data"]) / "f1_database.db"
 REPORT_DIR  = Path(CONFIG["paths"].get("reports", "reports"))
-REPORT_PATH = REPORT_DIR / "diagnostics_report.md"
+REPORT_PATH = REPORT_DIR / "data_quality" / "diagnostics_report.md"
 
 # ---------------------------------------------------------------------------
 # Logging

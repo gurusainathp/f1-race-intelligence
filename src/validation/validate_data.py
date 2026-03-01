@@ -2,7 +2,7 @@
 src/validation/validate_data.py
 =================================
 Run anytime before modeling to validate data integrity.
-Outputs: reports/data_quality_report.md
+Outputs: reports/data_quality/data_quality_report.md
 
 Checks performed:
   0. Quality scorecard
@@ -13,6 +13,9 @@ Checks performed:
   5. Duplicate detection  (sprint-race aware; checks constructorId as tiebreaker)
   6. Lap time validation  (tiered thresholds for SC/VSC laps + z-score outliers)
   7. Status & DNF validation (via results integration, improved classifier)
+  8. Feature table duplicate keys
+  9. Feature value bounds  (impossible values in derived feature columns)
+ 10. Points reconciliation (driver-race vs constructor-season aggregate cross-check)
 """
 
 import pandas as pd
@@ -36,15 +39,20 @@ try:
     _CONSTANTS_AVAILABLE = True
 except ImportError:
     _CONSTANTS_AVAILABLE = False
-    # Fallback values if constants.py is not on the path
     LAP_TIME_MIN_MS     = 40_000
     LAP_TIME_WARN_MS    = 300_000
     LAP_TIME_CORRUPT_MS = 600_000
     LAP_Z_THRESHOLD     = 5
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-INTERIM_DIR = Path("data/interim")
-REPORT_PATH = Path("reports/data_quality_report.md")
+INTERIM_DIR   = Path("data/interim")
+PROCESSED_DIR = Path("data/processed")
+REPORT_PATH   = Path("reports/data_quality/data_quality_report.md")
+
+# Parquet feature store paths (all live in data/processed/)
+DRIVER_RACE_PARQUET        = PROCESSED_DIR / "driver_race_features.parquet"
+DRIVER_SEASON_PARQUET      = PROCESSED_DIR / "driver_season_features.parquet"
+CONSTRUCTOR_SEASON_PARQUET = PROCESSED_DIR / "constructor_season_features.parquet"
 
 # Foreign key relationships: (child_table, child_col) → (parent_table, parent_col)
 FK_CHECKS = [
@@ -54,10 +62,10 @@ FK_CHECKS = [
     ("results", "statusId",      "status",       "statusId"),
 ]
 
-# Expected columns per table — extend as schema evolves
+# Expected columns per table
 EXPECTED_SCHEMA: dict[str, set[str]] = {
     "results":      {"resultId", "raceId", "driverId", "constructorId", "statusId",
-                     "grid", "grid_pit_lane", "is_shared_drive",
+                     "grid", "grid_pit_lane",
                      "position", "points", "laps"},
     "races":        {"raceId", "year", "round", "circuitId", "name", "date"},
     "drivers":      {"driverId", "driverRef", "forename", "surname", "nationality"},
@@ -66,69 +74,41 @@ EXPECTED_SCHEMA: dict[str, set[str]] = {
     "lap_times":    {"raceId", "driverId", "lap", "position", "lap_time_ms"},
 }
 
-# Columns expected in the master_race_table (produced by build_master_table.py)
-# These are checked separately in section_schema_drift if master_race_table is loaded.
 EXPECTED_MASTER_COLS: set[str] = {
-    "is_shared_drive", "pit_data_incomplete", "grid_pit_lane",
+    "pit_data_incomplete", "grid_pit_lane",
     "is_dnf", "dnf_type", "is_podium", "is_winner", "is_points_finish",
 }
 
-# ── Null context: columns whose high null rate is structurally expected ─────────
-# Format: col_name → (reason, min_null_pct_to_excuse)
-# These columns will be marked "ℹ️ Justified" rather than "❌ High" in the report.
+# ── Null context ────────────────────────────────────────────────────────────────
 JUSTIFIED_NULLS: dict[str, str] = {
-    # races — session dates only exist from 2021 Sprint calendar
-    "sprint_date": "Sprint sessions only from 2021 (~6% of races)",
-    "fp1_date":    "Session dates only recorded from 2021 era",
-    "fp2_date":    "Session dates only recorded from 2021 era",
-    "fp3_date":    "Session dates only recorded from 2021 era",
-    "quali_date":  "Session dates only recorded from 2021 era",
-    # drivers — permanent numbers introduced 2014, codes formalised in modern era
-    "number":      "Permanent driver numbers introduced in 2014 only",
-    "code":        "3-letter driver codes formalised in modern era only",
-    # results — timing only available for classified finishers / modern era
+    "sprint_date":       "Sprint sessions only from 2021 (~6% of races)",
+    "fp1_date":          "Session dates only recorded from 2021 era",
+    "fp2_date":          "Session dates only recorded from 2021 era",
+    "fp3_date":          "Session dates only recorded from 2021 era",
+    "quali_date":        "Session dates only recorded from 2021 era",
+    "number":            "Permanent driver numbers introduced in 2014 only",
+    "code":              "3-letter driver codes formalised in modern era only",
     "milliseconds":      "Finish time only for classified finishers (DNFs = null by design)",
     "time":              "Finish time only for classified finishers (DNFs = null by design)",
     "fastestLap":        "Fastest lap data standardised from 2004 season only",
     "fastestLapTime_ms": "Fastest lap data standardised from 2004 season only",
     "fastestLapSpeed":   "Fastest lap data standardised from 2004 season only",
     "rank":              "Fastest lap ranking introduced from 2019 season only",
-    # results — grid_pit_lane: 1 = post-1995 pit-lane start, 0 = not a pit-lane
-    # start or pre-1996 data gap. Always filled (int8 flag, never null).
     "grid_pit_lane": (
         "Binary flag: 1 = post-1995 pit-lane start, "
         "0 = not a pit-lane start or pre-1996 data gap. Always filled — never null"
     ),
-    # results — is_shared_drive: always filled int8 flag
-    "is_shared_drive": (
-        "Binary flag: 1 = pre-1970 car-sharing entry (1950s-60s shared-drive stints). "
-        "All duplicates confirmed as 1950-1964 races. Always filled — never null"
-    ),
-    # results — position: null for all DNFs (non-finishers have no finishing position).
-    # Diagnostics confirmed: null_position_count == dnf_flag_count (difference = 0).
-    # The 2 lapped finishers with null position in the Kaggle source were backfilled
-    # in clean_data.py from positionOrder. No unjustified nulls remain.
     "position": (
         "~41% null in results — expected: all DNFs have null position by design. "
         "Confirmed: null position count == DNF flag count (zero unexplained nulls). "
         "2 lapped-finisher gaps in Kaggle source backfilled from positionOrder in clean_data.py"
     ),
-    # results — grid: null for DNQ/DNS/pit-lane starters (grid=0 recoded to NaN).
-    # Pre-1996: 0 was a missing-data sentinel — not fixable, use positionOrder instead.
-    # Post-1995: genuine pit-lane starts — grid_pit_lane=1 identifies these rows.
     "grid": (
         "~6% null in results — grid=0 recoded to NaN. Two causes: (1) pre-1996 "
         "Kaggle missing-data sentinel (historic data gap, grid_pit_lane=0); "
         "(2) post-1995 genuine pit-lane starts (grid_pit_lane=1). "
         "Do NOT use grid alone for pre-1996 analysis"
     ),
-    # qualifying — session format dependent on era
-    # Pre-1996: single aggregate qualifying session (q1_ms captures the time)
-    # 1996-2002: two 1-hour sessions (q1_ms = session 1, q2_ms = session 2)
-    # 2003-2005: single-lap shootout format (q1_ms used, q2_ms/q3_ms null)
-    # 2006+:  three-part knockout format (Q1/Q2/Q3 as currently recorded)
-    # Nulls in q2_ms and q3_ms for pre-2006 races are therefore structurally
-    # expected. Post-2006 nulls are data gaps (DQ, DNS, 107% failure etc.).
     "q2_ms": (
         "Q2 null expected for single-session formats (pre-1996, 2003-2005). "
         "Post-2006: driver eliminated in Q1 or did not set a time (DNS/DQ/107%)"
@@ -137,11 +117,6 @@ JUSTIFIED_NULLS: dict[str, str] = {
         "Q3 only exists for top-10 qualifiers in 3-part format introduced 2006. "
         "Structural ~65% null for all post-2006 races; 100% null for all pre-2006"
     ),
-    # qualifying — q1_ms and best_quali_ms: residual nulls are confirmed data gaps.
-    # Causes investigated (2026-02-28): (1) entire races missing from Kaggle source
-    # (1995 Australian GP patched in patch_data.py); (2) 107% rule failures;
-    # (3) injury/DNS before Q1 began; (4) modern era: DQ/crash/mechanical before Q1.
-    # Not fixable in pipeline — these are genuine absent data, not encoding errors.
     "q1_ms": (
         "~1.3% null in qualifying — confirmed data gaps: entire races missing from "
         "Kaggle source (patched where possible), 107% failures, DNS/injury before Q1, "
@@ -151,9 +126,6 @@ JUSTIFIED_NULLS: dict[str, str] = {
         "Mirrors q1_ms nulls exactly — derived as min(q1_ms, q2_ms, q3_ms). "
         "Null only where all session times are null (same causes as q1_ms above)"
     ),
-    # pit_stops — pit_duration_ms: feed failures in specific races, not random noise.
-    # Confirmed: clustered in known races (2023 AUS GP 70.8%, 2021 Saudi GP 74.5% etc.).
-    # pit_data_incomplete flag in master_race_table marks affected races for exclusion.
     "pit_duration_ms": (
         "~4.7% null in pit_stops — clustered feed failures in specific races "
         "(2023 Australian GP 70.8%, 2021 Saudi GP 74.5%, etc.). Not random — "
@@ -162,26 +134,59 @@ JUSTIFIED_NULLS: dict[str, str] = {
     ),
 }
 
-# Columns that are high-null and genuinely still need investigation before modeling.
-# All previously documented items have been resolved and moved to JUSTIFIED_NULLS above.
-INVESTIGATE_NULLS: dict[str, str] = {
-    # Add new entries here as they are discovered. Format:
-    #   "column_name": "description of what needs investigation and current findings"
-}
+INVESTIGATE_NULLS: dict[str, str] = {}
+
+# ── Points reconciliation thresholds ───────────────────────────────────────────
+# Per-season delta between sum(driver points) and sum(constructor points).
+# delta = abs(driver_total - constructor_total) per season.
+#   <= POINTS_PASS_DELTA  : PASS  (within rounding / shared-drive tolerance)
+#   <= POINTS_WARN_DELTA  : WARN  (investigate but don't fail scorecard)
+#   >  POINTS_WARN_DELTA  : FAIL  (meaningful discrepancy — pipeline bug)
+POINTS_PASS_DELTA = 2.0
+POINTS_WARN_DELTA = 5.0
+
+# ── Impossible value bounds for feature columns ─────────────────────────────────
+# Format: (table_label, column, operator, threshold, severity, note)
+# operator: one of '<', '>', '=='
+# severity: 'FAIL' triggers scorecard failure; 'WARN' is advisory only
+BOUNDS_CHECKS = [
+    # driver_race_features
+    ("driver_race", "grid",             "<",  0,    "FAIL", "Grid position cannot be negative"),
+    ("driver_race", "finish_position",  "<",  1,    "FAIL", "Finish position cannot be below 1"),
+    ("driver_race", "positions_gained", "<", -30,   "FAIL", "Losing 30+ places in one race is impossible"),
+    ("driver_race", "positions_gained", ">",  33,   "FAIL", "Gaining 33+ places in one race is impossible (max grid ~20 cars)"),
+    ("driver_race", "points",           "<",  0,    "FAIL", "Race points cannot be negative"),
+    ("driver_race", "pit_stop_count",   "<",  0,    "FAIL", "Pit stop count cannot be negative"),
+    ("driver_race", "avg_pit_duration_ms", "<", 0,  "FAIL", "Pit duration cannot be negative"),
+    ("driver_race", "is_dnf",           "<",  0,    "FAIL", "is_dnf must be 0 or 1"),
+    ("driver_race", "is_dnf",           ">",  1,    "FAIL", "is_dnf must be 0 or 1"),
+    # driver_season_features
+    ("driver_season", "dnf_rate",       "<",  0,    "FAIL", "Rate cannot be negative"),
+    ("driver_season", "dnf_rate",       ">",  1,    "FAIL", "Rate cannot exceed 1.0"),
+    ("driver_season", "win_rate",       ">",  1,    "FAIL", "Rate cannot exceed 1.0"),
+    ("driver_season", "podium_rate",    ">",  1,    "FAIL", "Rate cannot exceed 1.0"),
+    ("driver_season", "races_entered",  "<",  1,    "FAIL", "Must have entered at least 1 race"),
+    ("driver_season", "avg_finish_position", "<", 1, "FAIL", "Avg finish position cannot be below 1"),
+    # constructor_season_features
+    ("constructor_season", "dnf_rate",  "<",  0,    "FAIL", "Rate cannot be negative"),
+    ("constructor_season", "dnf_rate",  ">",  1,    "FAIL", "Rate cannot exceed 1.0"),
+    ("constructor_season", "win_rate",  ">",  1,    "FAIL", "Rate cannot exceed 1.0"),
+    ("constructor_season", "driver_count", "<", 1,  "FAIL", "Constructor must have at least 1 driver"),
+    ("constructor_season", "driver_spread_avg_finish", "<", 0, "WARN",
+     "Spread is max−min so should always be >= 0; negative indicates a calculation error"),
+    ("constructor_season", "driver_spread_total_points", "<", 0, "WARN",
+     "Spread is max−min so should always be >= 0"),
+]
+
 
 # ── Status classifiers ─────────────────────────────────────────────────────────
-# Use shared classifiers from constants.py (single source of truth).
-# Fallback inline definitions are used only if constants.py is not on the path.
-
 if _CONSTANTS_AVAILABLE:
     def _is_dnf(label: str) -> bool:
         return _is_dnf_fn(label)
 
     def _is_finish(label: str) -> bool:
         return _is_finish_fn(label)
-
 else:
-    # Fallback — keep manually in sync with constants.py if that file is absent
     _FALLBACK_DNF = [
         "retired", "accident", "collision", "disqualified", "did not",
         "engine", "gearbox", "hydraulics", "brakes", "wheel", "fuel",
@@ -250,6 +255,29 @@ def load_tables() -> dict[str, pd.DataFrame]:
     return tables
 
 
+def load_feature_tables() -> dict[str, pd.DataFrame | None]:
+    """
+    Load the three parquet feature stores.
+    Returns a dict with keys 'driver_race', 'driver_season', 'constructor_season'.
+    Missing files are logged as warnings and stored as None — checks downstream
+    handle None gracefully and report the file as unavailable rather than crashing.
+    """
+    mapping = {
+        "driver_race":        DRIVER_RACE_PARQUET,
+        "driver_season":      DRIVER_SEASON_PARQUET,
+        "constructor_season": CONSTRUCTOR_SEASON_PARQUET,
+    }
+    result: dict[str, pd.DataFrame | None] = {}
+    for key, path in mapping.items():
+        if path.exists():
+            result[key] = pd.read_parquet(path)
+            print(f"  Loaded feature '{key}': {len(result[key]):,} rows × {result[key].shape[1]} cols")
+        else:
+            result[key] = None
+            print(f"  ⚠️  Feature '{key}' not found at {path} — skipping")
+    return result
+
+
 # ── Section 1: Dataset Inventory ──────────────────────────────────────────────
 
 def section_inventory(tables: dict[str, pd.DataFrame]) -> str:
@@ -271,13 +299,6 @@ def section_inventory(tables: dict[str, pd.DataFrame]) -> str:
 # ── Section 2: Null Analysis (context-aware) ──────────────────────────────────
 
 def section_null_analysis(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]:
-    """
-    Per-column null analysis with three-tier classification:
-      - Justified nulls  : structurally expected (era-based, format-based)
-      - Investigate nulls: high null rate without a clear structural reason
-      - Standard severity: Clean / Minor / Moderate / High
-    The scorecard passes only if there are no unjustified High-null columns.
-    """
     lines = ["## 2. Null Value Analysis", ""]
     unjustified_high_found = False
 
@@ -303,8 +324,6 @@ def section_null_analysis(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]:
                 severity = "ℹ️ Justified"
                 note     = JUSTIFIED_NULLS[col]
             elif col in INVESTIGATE_NULLS and val > 0:
-                # Investigate columns are flagged for human review, not automated failure.
-                # They have already been assessed — do NOT trigger scorecard failure here.
                 severity = "🔍 Investigate"
                 note     = INVESTIGATE_NULLS[col]
             elif val == 0:
@@ -326,7 +345,6 @@ def section_null_analysis(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]:
             )
         lines.append("")
 
-    # Summary callout block
     lines += [
         "### Null Classification Legend",
         "",
@@ -445,29 +463,15 @@ def section_fk_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]:
     return "\n".join(lines), all_pass
 
 
-# ── Section 5: Duplicate Detection (sprint-aware, car-sharing-aware) ──────────
+# ── Section 5: Duplicate Detection ────────────────────────────────────────────
 
 def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]:
     """
     Duplicate raceId × driverId detection with three known-legitimate categories:
-
-    1. Sprint Race (2021+)
-       Sprint + Main race share the same raceId. Identified by: year >= 2021
-       AND rows are unique on the 3-key (raceId, driverId, constructorId).
-
-    2. Dual Constructor (any era)
-       Driver raced for two different constructors in the same event.
-       Identified by: constructorId differs across duplicate rows.
-
-    3. Car Sharing (pre-1970 F1)
-       Common 1950s–1960s practice where multiple drivers shared one car in
-       stints. Identified by: year < 1970 AND same constructorId across rows
-       AND different laps values (different stint lengths).
-       Confirmed by diagnostics_report.md (2026-02-28): all 37 "unexplained"
-       raceIds from 1950–1964 are car-sharing entries. Not data errors.
-
-    Scorecard fails only if unexplained duplicates remain after all three
-    categories are checked.
+      1. Dual Constructor: same raceId/driverId pair but different constructorId
+      2. Shared Drive: same raceId/driverId/constructorId but different laps or position
+      3. Unexplained: any other case
+    Scorecard fails only if unexplained duplicates remain.
     """
     lines = ["## 5. Duplicate Race-Driver Records", ""]
 
@@ -484,17 +488,44 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
     dupe_mask     = results.duplicated(subset=subset, keep=False)
     dupe_pairs    = int(results.duplicated(subset=subset).sum())
     rows_affected = int(dupe_mask.sum())
-    passed        = dupe_pairs == 0
-
-    # Classification sets — populated inside the block below
-    sprint_race_ids  = set()
+    
+    # Scorecard fails only if there are unexplained duplicates
     dual_constructor = set()
-    car_sharing      = set()
+    shared_drive     = set()
     unexplained      = set()
+
+    if dupe_pairs > 0:
+        dupe_df = results[dupe_mask].copy()
+        
+        has_constructor = "constructorId" in results.columns
+        has_laps        = "laps" in results.columns
+        has_position    = "position" in results.columns
+
+        for (race_id, driver_id), grp in dupe_df.groupby(["raceId", "driverId"]):
+            pair = (race_id, driver_id)
+            
+            # Check 1: Dual constructor — different constructorId in the pair
+            if has_constructor and grp["constructorId"].nunique() > 1:
+                dual_constructor.add(pair)
+                continue
+            
+            # Check 2: Shared drive — same constructor but different laps or position
+            if (has_constructor and has_laps 
+                    and grp["constructorId"].nunique() == 1):
+                laps_differ = (grp["laps"].max() - grp["laps"].min()) > 0
+                position_differ = (has_position and grp["position"].nunique() > 1)
+                if laps_differ or position_differ:
+                    shared_drive.add(pair)
+                    continue
+            
+            # Check 3: Unexplained
+            unexplained.add(pair)
+
+    passed = len(unexplained) == 0
 
     lines += [
         f"**Composite key:** `raceId × driverId`",
-        f"**Duplicate pairs found:** {dupe_pairs:,}  →  {_badge(passed)}",
+        f"**Duplicate pairs found:** {dupe_pairs:,}",
         f"**Rows affected:** {rows_affected:,} / {len(results):,}"
         f" ({_pct(rows_affected, len(results))})",
         "",
@@ -503,47 +534,7 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
     if dupe_pairs > 0:
         dupe_df = results[dupe_mask].copy()
 
-        has_race_year = ("races" in tables and "year" in tables["races"].columns
-                         and "raceId" in tables["races"].columns)
-
-        if has_race_year:
-            race_year_map = tables["races"].set_index("raceId")["year"]
-        else:
-            race_year_map = pd.Series(dtype=int)
-
-        has_constructor = "constructorId" in results.columns
-        has_laps        = "laps" in results.columns
-
-        for (race_id, driver_id), grp in dupe_df.groupby(["raceId", "driverId"]):
-            year = int(race_year_map.get(race_id, 0) or 0)
-
-            # ── Check 1: Dual constructor ─────────────────────────────────────
-            # Rows differ in constructorId → driver raced for two teams.
-            if has_constructor and grp["constructorId"].nunique() > 1:
-                dual_constructor.add(race_id)
-                continue
-
-            # ── Check 2: Sprint race (2021+) ──────────────────────────────────
-            # Same constructor, different laps, modern era.
-            if year >= 2021:
-                sprint_race_ids.add(race_id)
-                continue
-
-            # ── Check 3: Car sharing (pre-1970) ───────────────────────────────
-            # Same constructor, different lap counts → shared-drive stints.
-            # Confirmed in Kaggle F1 dataset: 1950–1964 races only.
-            if (year < 1970
-                    and has_laps
-                    and has_constructor
-                    and grp["constructorId"].nunique() == 1
-                    and (grp["laps"].max() - grp["laps"].min()) > 0):
-                car_sharing.add(race_id)
-                continue
-
-            # ── No known pattern matches ──────────────────────────────────────
-            unexplained.add(race_id)
-
-        all_affected   = sorted(dupe_df["raceId"].unique())
+        all_affected   = sorted(set(pair[0] for pair in dual_constructor | shared_drive | unexplained))
         distinct_races = len(all_affected)
         id_display     = ", ".join(f"`{r}`" for r in all_affected[:30])
         truncation     = f" _(showing first 30 of {distinct_races})_" if distinct_races > 30 else ""
@@ -554,135 +545,105 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
             "",
             "### Duplicate Root Cause Classification",
             "",
-            "| Category | Race Count | Interpretation | Action |",
-            "|----------|----------:|----------------|--------|",
-            f"| 🏎️ Sprint Race (2021+) | {len(sprint_race_ids)} "
-            f"| Sprint + Main race share same raceId | Add `session_type` column or separate table |",
+            "| Category | Pairs | Interpretation | Scorecard |",
+            "|----------|------:|----------------|:---------:|",
             f"| 🏛️ Dual Constructor | {len(dual_constructor)} "
-            f"| Driver raced for 2 teams in same event | Extend key with `constructorId` |",
-            f"| 🤝 Car Sharing (pre-1970) | {len(car_sharing)} "
-            f"| 1950s–60s shared-drive stints — expected historical data | Add `is_shared_drive` flag |",
+            f"| Driver raced for 2 teams in same event — expected | ✅ Ignored |",
+            f"| 🤝 Shared Drive | {len(shared_drive)} "
+            f"| Same team but different laps/position — expected | ✅ Ignored |",
             f"| ❓ Unexplained | {len(unexplained)} "
-            f"| No structural reason found | **Investigate immediately** |",
+            f"| No structural reason found | {'✅ None' if len(unexplained) == 0 else '❌ FAIL'} |",
         ]
 
-        if unexplained:
-            unexplained_ids = ", ".join(f"`{r}`" for r in sorted(unexplained))
+        if len(unexplained) > 0:
+            unexplained_ids = ", ".join(f"`{r}`" for r in sorted(set(pair[0] for pair in unexplained)))
             lines += [
                 "",
                 f"> ⚠️ **Unexplained duplicate raceIds:** {unexplained_ids}  ",
-                "> These do not match Sprint, dual-constructor, or car-sharing patterns. "
-                "Investigate before modeling.",
+                "> These do not match dual-constructor or shared-drive patterns.",
             ]
 
-        if car_sharing:
+        if len(shared_drive) > 0:
             lines += [
                 "",
-                "> ℹ️ **Car-sharing duplicates are expected historical data.** In 1950s–60s F1,"
-                " multiple drivers shared one car in stints. Each stint is a separate row."
-                " For main-race analysis, use the row with the highest `laps` value"
-                " (final driver to take the wheel). Consider adding an `is_shared_drive` flag.",
+                "> ℹ️ **Shared-drive duplicates are expected.** Multiple drivers shared one car in stints,"
+                " producing different laps/position values for the same raceId×driverId pair.",
             ]
 
-        # Per-race summary table
-        race_summary = (
-            dupe_df.groupby("raceId")
-            .apply(lambda g: g.duplicated(subset=["driverId"]).sum(), include_groups=False)
-            .reset_index(name="duplicate_pairs")
-            .sort_values("duplicate_pairs", ascending=False)
-            .head(15)
-        )
+        # Per-race summary
+        all_pairs = dual_constructor | shared_drive | unexplained
+        race_pair_breakdown = {}
+        for race_id, driver_id in all_pairs:
+            if race_id not in race_pair_breakdown:
+                race_pair_breakdown[race_id] = {"dual": 0, "shared": 0, "unexplained": 0}
+            if (race_id, driver_id) in dual_constructor:
+                race_pair_breakdown[race_id]["dual"] += 1
+            elif (race_id, driver_id) in shared_drive:
+                race_pair_breakdown[race_id]["shared"] += 1
+            else:
+                race_pair_breakdown[race_id]["unexplained"] += 1
 
-        if has_race_year:
-            race_summary["year"] = race_summary["raceId"].map(race_year_map).fillna("?").astype(str)
-            race_summary["category"] = race_summary["raceId"].apply(
-                lambda r: (
-                    "🏎️ Sprint"         if r in sprint_race_ids
-                    else "🏛️ Dual Constructor" if r in dual_constructor
-                    else "🤝 Car Sharing"       if r in car_sharing
-                    else "❓ Unexplained"
-                )
-            )
+        race_summary_rows = sorted(
+            race_pair_breakdown.items(),
+            key=lambda x: (x[1]["unexplained"], x[1]["dual"] + x[1]["shared"]),
+            reverse=True
+        )[:15]
 
         lines += ["", "**Top affected races (up to 15):**", ""]
-
-        if has_race_year:
-            lines += [
-                "| raceId | Year | Duplicate Pairs | Category |",
-                "|-------:|-----:|----------------:|----------|",
-            ]
-            for _, row in race_summary.iterrows():
-                lines.append(
-                    f"| {int(row['raceId'])} | {row['year']}"
-                    f" | {int(row['duplicate_pairs'])} | {row['category']} |"
-                )
-        else:
-            lines += [
-                "| raceId | Duplicate Pairs |",
-                "|-------:|----------------:|",
-            ]
-            for _, row in race_summary.iterrows():
-                lines.append(f"| {int(row['raceId'])} | {int(row['duplicate_pairs'])} |")
+        lines += [
+            "| raceId | Dual Constructor | Shared Drive | Unexplained |",
+            "|-------:|----------------:|-------------:|------------:|",
+        ]
+        for race_id, counts in race_summary_rows:
+            lines.append(
+                f"| {race_id} | {counts['dual']} | {counts['shared']} | {counts['unexplained']} |"
+            )
 
         # All pairs table
-        all_dupes = (
-            dupe_df.groupby(subset)
-            .size()
-            .reset_index(name="occurrences")
-            .sort_values("occurrences", ascending=False)
-            .head(20)
-        )
+        all_dupes_list = sorted(all_pairs)
         lines += [
             "",
-            "**All duplicate pairs (up to 20):**",
+            "**All duplicate pairs:**",
             "",
-            "| raceId | driverId | Occurrences |",
-            "|-------:|---------:|------------:|",
+            "| raceId | driverId | Category |",
+            "|-------:|---------:|----------|",
         ]
-        for _, row in all_dupes.iterrows():
-            lines.append(f"| {int(row['raceId'])} | {int(row['driverId'])} | {int(row['occurrences'])} |")
+        for race_id, driver_id in all_dupes_list[:50]:
+            if (race_id, driver_id) in dual_constructor:
+                cat = "🏛️ Dual Constructor"
+            elif (race_id, driver_id) in shared_drive:
+                cat = "🤝 Shared Drive"
+            else:
+                cat = "❓ Unexplained"
+            lines.append(f"| {race_id} | {driver_id} | {cat} |")
+        
+        if len(all_dupes_list) > 50:
+            lines.append(f"_(showing first 50 of {len(all_dupes_list)} pairs)_")
 
         lines += [
             "",
             "### Recommended Fix",
-            "",
-            "**If duplicates are Sprint races (2021+):**",
-            "```python",
-            "# Add session_type to differentiate Sprint from Main Race",
-            "results['session_type'] = results.groupby(['raceId','driverId']).cumcount()",
-            "results['session_type'] = results['session_type'].map({0: 'main', 1: 'sprint'})",
-            "```",
-            "",
-            "**If duplicates are Car Sharing (pre-1970):**",
-            "```python",
-            "# Keep only the final stint (highest laps = last driver in the car)",
-            "results = results.sort_values('laps', ascending=False)",
-            "results = results.drop_duplicates(subset=['raceId', 'driverId'], keep='first')",
-            "# Or: flag all shared-drive rows for separate analysis",
-            "results['is_shared_drive'] = results.duplicated(",
-            "    subset=['raceId', 'driverId'], keep=False).astype('int8')",
-            "```",
         ]
 
-    # Scorecard: pass if zero unexplained duplicates.
-    # Sprint, dual-constructor, and car-sharing duplicates are all structurally
-    # expected — they are not data errors.
-    scorecard_pass = dupe_pairs == 0 or len(unexplained) == 0
+        if len(unexplained) > 0:
+            lines += [
+                "",
+                "**For unexplained duplicates, investigate:**",
+                "```python",
+                "# Check the specific pairs to understand the data structure",
+                "unexplained_pairs = [(race_id, driver_id), ...]",
+                "for race_id, driver_id in unexplained_pairs:",
+                "    print(results[(results['raceId'] == race_id) & (results['driverId'] == driver_id)])",
+                "```",
+            ]
 
-    return "\n".join(lines), scorecard_pass
+    lines.append(f"**Overall:** {_badge(passed)}")
+    return "\n".join(lines), passed
 
 
-# ── Section 6: Lap Time Validation (tiered thresholds) ────────────────────────
+# ── Section 6: Lap Time Validation ────────────────────────────────────────────
 
 def section_lap_time_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]:
-    """
-    Three-tier threshold check:
-      < 40 s      → corrupt (impossible)
-      300–600 s   → warning (Safety Car / VSC / formation lap — real but anomalous)
-      > 600 s     → corrupt (no F1 lap legitimately takes 10+ minutes)
-    Plus z-score outlier detection.
-    Scorecard fails only on confirmed corrupt records, not SC/VSC warnings.
-    """
     lines = ["## 6. Lap Time Validation", ""]
 
     if "lap_times" not in tables:
@@ -697,30 +658,18 @@ def section_lap_time_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, b
     n_valid = len(series)
     n_null  = n_total - n_valid
 
-    # Threshold tiers
     negatives   = int((series < 0).sum())
     too_fast    = int(((series >= 0) & (series < LAP_TIME_MIN_MS)).sum())
     sc_vsc_laps = int(((series > LAP_TIME_WARN_MS) & (series <= LAP_TIME_CORRUPT_MS)).sum())
     corrupt     = int((series > LAP_TIME_CORRUPT_MS).sum())
     hard_fail   = negatives + too_fast + corrupt
 
-    # Z-score outlier detection (advisory — does NOT fail the scorecard)
-    # Rationale: a global z-score across 70+ circuits and 75 years of racing
-    # will always flag SC/VSC slow laps as outliers. The meaningful corruption
-    # check is the hard threshold (> 600 s) above. Z-score is surfaced here for
-    # informational purposes only — it helps identify SC/VSC events worth flagging
-    # with an is_slow_lap column in lap_times, but it is NOT a data quality failure.
     z_scores  = (series - series.mean()) / series.std()
     z_extreme = int((z_scores.abs() > LAP_Z_THRESHOLD).sum())
-
-    # Outliers that are ALSO in the SC/VSC band are already flagged above.
-    # Unexplained = z-outliers that are BELOW the SC/VSC threshold (300 s).
-    # In practice this is almost always 0 given the current dataset.
     z_unexplained = int(
         ((z_scores.abs() > LAP_Z_THRESHOLD) & (series <= LAP_TIME_WARN_MS)).sum()
     )
 
-    # Scorecard passes on hard failures only — z-score is advisory
     passed = hard_fail == 0
 
     lines += [
@@ -761,29 +710,19 @@ def section_lap_time_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, b
         lines += [
             "",
             "> ℹ️ **SC/VSC laps are not data errors.** Safety Car and Virtual Safety Car periods"
-            " routinely produce lap times of 3–5 minutes. These should be **excluded from"
-            " race-pace modeling** but retained for full-race analysis.",
+            " routinely produce lap times of 3–5 minutes.",
             "",
-            "**Recommended handling in pipeline:**",
             "```python",
-            "# Flag SC/VSC laps rather than dropping them",
             f"lap_times['is_slow_lap'] = lap_times['lap_time_ms'] > {LAP_TIME_WARN_MS}",
-            "# Use only normal laps for pace analysis",
             "normal_laps = lap_times[~lap_times['is_slow_lap']]",
             "```",
         ]
 
-    # Z-score section (advisory only)
     lines += [
         "",
         "### Statistical Outlier Detection (Z-Score) — Advisory",
         "",
-        f"> Flags lap times where |z| > {LAP_Z_THRESHOLD}"
-        f" (more than {LAP_Z_THRESHOLD} standard deviations from the mean).",
-        "> **This check is advisory and does not affect the scorecard.**",
-        "> A global z-score across 70+ circuits and 75 seasons will always flag",
-        "> SC/VSC slow laps. The hard corruption threshold (> 600 s) above is the",
-        "> authoritative data-quality check.",
+        f"> Flags lap times where |z| > {LAP_Z_THRESHOLD}. Advisory only — does not affect scorecard.",
         "",
         "| Metric | Value |",
         "|--------|------:|",
@@ -812,9 +751,9 @@ def section_lap_time_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, b
             "|-------:|---------:|----:|-----------:|--------:|--------------|",
         ]
         for _, row in top_outliers.iterrows():
-            lap_s    = row["lap_time_ms"] / 1000
-            z_val    = row["z"]
-            cause    = "SC/VSC or red flag" if row["lap_time_ms"] <= LAP_TIME_CORRUPT_MS else "Likely corrupt"
+            lap_s  = row["lap_time_ms"] / 1000
+            z_val  = row["z"]
+            cause  = "SC/VSC or red flag" if row["lap_time_ms"] <= LAP_TIME_CORRUPT_MS else "Likely corrupt"
             lines.append(
                 f"| {int(row['raceId'])} | {int(row['driverId'])}"
                 f" | {int(row['lap'])} | {lap_s:.1f} | {z_val:+.2f} | {cause} |"
@@ -823,14 +762,9 @@ def section_lap_time_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, b
     return "\n".join(lines), passed
 
 
-# ── Section 7: Status Validation (via results, improved classifier) ───────────
+# ── Section 7: Status Validation ──────────────────────────────────────────────
 
 def section_status_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]:
-    """
-    Validates status integration end-to-end via results.statusId mapping.
-    Improved classifier handles lapped finishers (+N Laps), expanded DNF keywords,
-    and surfaces the 'Other/Unclassified' bucket for manual review.
-    """
     lines = ["## 7. Status & DNF Validation", ""]
 
     if "status" not in tables:
@@ -885,7 +819,6 @@ def section_status_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, boo
         "",
     ]
 
-    # Other bucket detail — surface for investigation
     other_rows = (
         status_usage.loc[status_usage["category"] == "Other"]
         .sort_values("count", ascending=False)
@@ -907,7 +840,6 @@ def section_status_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, boo
             )
         lines.append("")
 
-    # Top 10 DNF causes
     top_dnf = (
         status_usage.loc[status_usage["category"] == "DNF"]
         .sort_values("count", ascending=False)
@@ -927,7 +859,6 @@ def section_status_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, boo
             )
         lines.append("")
 
-    # Finished breakdown
     finish_rows = (
         status_usage.loc[status_usage["category"] == "Finished"]
         .sort_values("count", ascending=False)
@@ -946,6 +877,472 @@ def section_status_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, boo
             )
 
     return "\n".join(lines), passed
+
+
+# ===========================================================================
+# Section 8: Feature Table Duplicate Keys
+# ===========================================================================
+
+def section_feature_duplicate_keys(
+    feature_tables: dict[str, pd.DataFrame | None],
+) -> tuple[str, bool]:
+    """
+    Assert that every feature table has a unique composite key.
+
+    Expected keys:
+      driver_race        : (raceId, driverId)
+      driver_season      : (driverId, race_year)
+      constructor_season : (constructorId, race_year)
+
+    For driver_race specifically, duplicates are classified using the exact same
+    logic as Section 5:
+      - Dual Constructor (constructorId differs)  — expected, does NOT fail
+      - Shared Drive (same constructorId but different laps or position) — expected, does NOT fail
+      - Unexplained (any other case) — fails the scorecard
+
+    driver_season and constructor_season have no legitimate duplicate causes;
+    any duplicate there is a pipeline bug and fails immediately.
+    """
+    lines    = ["## 8. Feature Table — Duplicate Key Check", ""]
+    all_pass = True
+
+    key_map = {
+        "driver_race":        ["raceId", "driverId"],
+        "driver_season":      ["driverId", "race_year"],
+        "constructor_season": ["constructorId", "race_year"],
+    }
+
+    lines += [
+        "| Table | Key Columns | Rows | Duplicate Pairs | Unexplained | Result |",
+        "|-------|-------------|-----:|----------------:|------------:|:------:|",
+    ]
+
+    for table_key, key_cols in key_map.items():
+        df = feature_tables.get(table_key)
+
+        if df is None:
+            lines.append(
+                f"| `{table_key}` | {', '.join(f'`{c}`' for c in key_cols)}"
+                f" | — | — | — | ⚠️ File not found |"
+            )
+            all_pass = False
+            continue
+
+        missing_key_cols = [c for c in key_cols if c not in df.columns]
+        if missing_key_cols:
+            lines.append(
+                f"| `{table_key}` | {', '.join(f'`{c}`' for c in key_cols)}"
+                f" | {len(df):,} | — | — | ⚠️ Key col(s) missing: {missing_key_cols} |"
+            )
+            all_pass = False
+            continue
+
+        dupe_count = int(df.duplicated(subset=key_cols).sum())
+
+        # ── driver_race: classify duplicates before deciding pass/fail ─────
+        if table_key == "driver_race" and dupe_count > 0:
+            dupe_mask = df.duplicated(subset=key_cols, keep=False)
+            dupe_df   = df[dupe_mask].copy()
+
+            has_constr = "constructorId" in df.columns
+            has_laps   = "laps" in df.columns
+            has_position = "position" in df.columns
+
+            dual_constr_pairs = set()
+            shared_drive_pairs = set()
+            unexplained_pairs = set()
+
+            for (race_id, driver_id), grp in dupe_df.groupby(["raceId", "driverId"]):
+                pair = (race_id, driver_id)
+
+                # Check 1: Dual constructor — different constructorId in the pair
+                if has_constr and grp["constructorId"].nunique() > 1:
+                    dual_constr_pairs.add(pair)
+                    continue
+
+                # Check 2: Shared drive — same constructor but different laps or position
+                if (has_constr and has_laps 
+                        and grp["constructorId"].nunique() == 1):
+                    laps_differ = (grp["laps"].max() - grp["laps"].min()) > 0
+                    position_differ = (has_position and grp["position"].nunique() > 1)
+                    if laps_differ or position_differ:
+                        shared_drive_pairs.add(pair)
+                        continue
+
+                # Check 3: Unexplained
+                unexplained_pairs.add(pair)
+
+            n_dual_constr = len(dual_constr_pairs)
+            n_shared = len(shared_drive_pairs)
+            n_unexplained = len(unexplained_pairs)
+            passed        = n_unexplained == 0
+            if not passed:
+                all_pass = False
+
+            lines.append(
+                f"| `{table_key}` | {', '.join(f'`{c}`' for c in key_cols)}"
+                f" | {len(df):,} | {dupe_count:,} | {n_unexplained:,} | {_badge(passed)} |"
+            )
+
+            # Classification breakdown (always shown when driver_race has dupes)
+            lines += [
+                "",
+                f"**`driver_race` duplicate classification** ({dupe_count} pairs total):",
+                "",
+                "| Category | Pairs | Interpretation | Scorecard |",
+                "|----------|------:|----------------|:---------:|",
+                f"| 🏛️ Dual Constructor | {n_dual_constr}"
+                f" | Driver raced for 2 teams in same event — expected | ✅ Ignored |",
+                f"| 🤝 Shared Drive | {n_shared}"
+                f" | Same team but different laps/position — expected | ✅ Ignored |",
+                f"| ❓ Unexplained | {n_unexplained}"
+                f" | No structural reason found"
+                f" | {'✅ None' if n_unexplained == 0 else '❌ FAIL'} |",
+                "",
+            ]
+
+            if n_unexplained > 0:
+                unexplained_index = pd.MultiIndex.from_tuples(
+                    unexplained_pairs, names=["raceId", "driverId"]
+                )
+                unexplained_rows = (
+                    dupe_df
+                    .set_index(["raceId", "driverId"])
+                    .loc[lambda d: d.index.isin(unexplained_index)]
+                    .reset_index()
+                    .sort_values(key_cols)
+                    .head(10)
+                )
+                lines += [
+                    "**Unexplained duplicate rows in `driver_race` (up to 10):**",
+                    "",
+                    "| raceId | driverId | constructorId | (other columns) |",
+                    "|-------:|---------:|--------------:|-----------------|",
+                ]
+                for _, row in unexplained_rows.iterrows():
+                    constr_val = str(int(row["constructorId"])) if has_constr and pd.notna(row.get("constructorId")) else "—"
+                    lines.append(
+                        f"| {int(row['raceId'])} | {int(row['driverId'])}"
+                        f" | {constr_val} | _(see parquet for full row)_ |"
+                    )
+                lines.append("")
+
+        # ── driver_season / constructor_season: no legitimate duplicates ───
+        else:
+            passed = dupe_count == 0
+            if not passed:
+                all_pass = False
+
+            lines.append(
+                f"| `{table_key}` | {', '.join(f'`{c}`' for c in key_cols)}"
+                f" | {len(df):,} | {dupe_count:,} | {dupe_count:,} | {_badge(passed)} |"
+            )
+
+            if not passed:
+                dupe_mask   = df.duplicated(subset=key_cols, keep=False)
+                sample_rows = df[dupe_mask].sort_values(key_cols).head(10)
+                lines += [
+                    "",
+                    f"**Sample duplicate rows in `{table_key}` (up to 10):**",
+                    "",
+                    f"| {' | '.join(key_cols)} | (row preview) |",
+                    f"|{'|'.join(['---:'] * len(key_cols))}|---|",
+                ]
+                for _, row in sample_rows.iterrows():
+                    key_vals = " | ".join(str(row[c]) for c in key_cols)
+                    lines.append(f"| {key_vals} | _(see parquet for full row)_ |")
+                lines.append("")
+
+    lines += [
+        "",
+        f"**Overall:** {_badge(all_pass)}",
+        "",
+        "> ℹ️ For `driver_race`, dual-constructor and shared-drive duplicates"
+        " are structurally expected (mirrors Section 5 logic). Only unexplained duplicates"
+        " fail the scorecard.",
+    ]
+    return "\n".join(lines), all_pass
+
+
+# ===========================================================================
+# Section 9: Feature Value Bounds
+# ===========================================================================
+
+def section_feature_bounds(
+    feature_tables: dict[str, pd.DataFrame | None],
+) -> tuple[str, bool]:
+    """
+    Check that derived feature columns contain no impossible values.
+
+    Two severities:
+      FAIL — logically impossible; scorecard fails if any violations found.
+      WARN — suspicious but not impossible; advisory only, does not fail scorecard.
+
+    See BOUNDS_CHECKS at the top of this file for the full list.
+    """
+    lines    = ["## 9. Feature Value Bounds Check", ""]
+    any_fail = False
+
+    # Group checks by table for readable output
+    tables_covered = sorted({b[0] for b in BOUNDS_CHECKS})
+
+    lines += [
+        "| Table | Column | Check | Violations | Severity | Result |",
+        "|-------|--------|-------|----------:|:--------:|:------:|",
+    ]
+
+    violation_details: list[str] = []
+
+    for table_key in tables_covered:
+        df = feature_tables.get(table_key)
+
+        table_checks = [b for b in BOUNDS_CHECKS if b[0] == table_key]
+
+        for _, col, op, threshold, severity, note in table_checks:
+            if df is None:
+                lines.append(
+                    f"| `{table_key}` | `{col}` | — | — | — | ⚠️ File not found |"
+                )
+                if severity == "FAIL":
+                    any_fail = True
+                continue
+
+            if col not in df.columns:
+                # Column absent — skip silently (may be legitimately optional)
+                continue
+
+            series = pd.to_numeric(df[col], errors="coerce").dropna()
+
+            if op == "<":
+                mask = series < threshold
+            elif op == ">":
+                mask = series > threshold
+            elif op == "==":
+                mask = series == threshold
+            else:
+                continue
+
+            n_violations = int(mask.sum())
+            passed       = n_violations == 0
+
+            op_str       = f"`{col}` {op} {threshold}"
+            result_badge = _badge(passed) if severity == "FAIL" else (
+                "✅ PASS" if passed else "⚠️ WARN"
+            )
+
+            if not passed and severity == "FAIL":
+                any_fail = True
+
+            lines.append(
+                f"| `{table_key}` | `{col}` | {op_str}"
+                f" | {n_violations:,} | {'❌' if severity == 'FAIL' else '⚠️'} {severity}"
+                f" | {result_badge} |"
+            )
+
+            # Collect violating rows for detail block
+            if not passed:
+                bad_idx    = mask[mask].index
+                sample_df  = df.loc[bad_idx].head(5)
+                key_cols   = {
+                    "driver_race":        ["raceId", "driverId"],
+                    "driver_season":      ["driverId", "race_year"],
+                    "constructor_season": ["constructorId", "race_year"],
+                }.get(table_key, [])
+                display_cols = [c for c in key_cols + [col] if c in sample_df.columns]
+
+                violation_details += [
+                    f"**`{table_key}.{col}` {op} {threshold} — sample violations (up to 5):**",
+                    f"_Note: {note}_",
+                    "",
+                    f"| {' | '.join(display_cols)} |",
+                    f"|{'|'.join(['---'] * len(display_cols))}|",
+                ]
+                for _, row in sample_df.iterrows():
+                    vals = " | ".join(str(row[c]) for c in display_cols)
+                    violation_details.append(f"| {vals} |")
+                violation_details.append("")
+
+    lines += ["", f"**Overall (FAIL-severity checks only):** {_badge(not any_fail)}"]
+
+    if violation_details:
+        lines += ["", "### Violation Detail", ""] + violation_details
+
+    lines += [
+        "",
+        "> _WARN-severity violations are advisory and do not affect the scorecard._",
+    ]
+
+    return "\n".join(lines), not any_fail
+
+
+# ===========================================================================
+# Section 10: Points Reconciliation
+# ===========================================================================
+
+def section_points_reconciliation(
+    feature_tables: dict[str, pd.DataFrame | None],
+) -> tuple[str, bool]:
+    """
+    Cross-check: sum(driver-race points) per season == sum(constructor-season total_points)
+    per season.
+
+    In F1 the two totals should match exactly (both are derived from race results).
+    Historical car-sharing entries and scoring rule changes can introduce small
+    discrepancies, so we apply a tiered tolerance:
+
+      delta <= POINTS_PASS_DELTA  : ✅ PASS
+      delta <= POINTS_WARN_DELTA  : ⚠️ WARN  (advisory, does not fail scorecard)
+      delta >  POINTS_WARN_DELTA  : ❌ FAIL
+
+    Scorecard fails only if any season has delta > POINTS_WARN_DELTA.
+
+    Sources:
+      driver_race_features        : grain = driver × race  — sum `points` per season
+      constructor_season_features : grain = constructor × season — sum `total_points` per season
+    """
+    lines = ["## 10. Points Reconciliation — Driver vs Constructor Totals", ""]
+
+    dr_df   = feature_tables.get("driver_race")
+    con_df  = feature_tables.get("constructor_season")
+
+    # ── Availability guard ──────────────────────────────────────────────────
+    if dr_df is None or con_df is None:
+        missing = []
+        if dr_df  is None: missing.append("`driver_race_features`")
+        if con_df is None: missing.append("`constructor_season_features`")
+        msg = ", ".join(missing)
+        lines += [
+            f"> ⚠️ Cannot run reconciliation — {msg} not available.",
+            f"> Run `build_features.py` first to generate the parquet files.",
+        ]
+        return "\n".join(lines), False
+
+    # ── Column guard ────────────────────────────────────────────────────────
+    dr_year_col  = "race_year"
+    con_year_col = "race_year"
+
+    missing_cols: list[str] = []
+    if "points"       not in dr_df.columns:  missing_cols.append("driver_race.points")
+    if dr_year_col    not in dr_df.columns:  missing_cols.append(f"driver_race.{dr_year_col}")
+    if "total_points" not in con_df.columns: missing_cols.append("constructor_season.total_points")
+    if con_year_col   not in con_df.columns: missing_cols.append(f"constructor_season.{con_year_col}")
+
+    if missing_cols:
+        lines += [
+            f"> ⚠️ Reconciliation skipped — missing columns: {', '.join(f'`{c}`' for c in missing_cols)}",
+        ]
+        return "\n".join(lines), False
+
+    # ── Aggregate to season level ───────────────────────────────────────────
+    driver_season_pts = (
+        dr_df
+        .groupby(dr_year_col)["points"]
+        .sum()
+        .rename("driver_total")
+        .reset_index()
+        .rename(columns={dr_year_col: "season"})
+    )
+
+    constructor_season_pts = (
+        con_df
+        .groupby(con_year_col)["total_points"]
+        .sum()
+        .rename("constructor_total")
+        .reset_index()
+        .rename(columns={con_year_col: "season"})
+    )
+
+    recon = driver_season_pts.merge(constructor_season_pts, on="season", how="outer")
+    recon["driver_total"]      = recon["driver_total"].fillna(0)
+    recon["constructor_total"] = recon["constructor_total"].fillna(0)
+    recon["delta"]             = (recon["driver_total"] - recon["constructor_total"]).abs()
+    recon = recon.sort_values("season")
+
+    # ── Classify each season ────────────────────────────────────────────────
+    def _classify(delta: float) -> str:
+        if delta <= POINTS_PASS_DELTA:
+            return "✅ PASS"
+        elif delta <= POINTS_WARN_DELTA:
+            return "⚠️ WARN"
+        else:
+            return "❌ FAIL"
+
+    recon["result"] = recon["delta"].apply(_classify)
+
+    n_seasons     = len(recon)
+    n_pass        = int((recon["result"] == "✅ PASS").sum())
+    n_warn        = int((recon["result"] == "⚠️ WARN").sum())
+    n_fail        = int((recon["result"] == "❌ FAIL").sum())
+    scorecard_pass = n_fail == 0
+
+    lines += [
+        f"**Tolerance bands:**  "
+        f"PASS ≤ {POINTS_PASS_DELTA} pts  |  "
+        f"WARN ≤ {POINTS_WARN_DELTA} pts  |  "
+        f"FAIL > {POINTS_WARN_DELTA} pts",
+        "",
+        "### Season-Level Summary",
+        "",
+        f"| Outcome | Seasons | % of Seasons |",
+        f"|---------|--------:|-------------:|",
+        f"| ✅ PASS (delta ≤ {POINTS_PASS_DELTA}) | {n_pass} | {_pct(n_pass, n_seasons)} |",
+        f"| ⚠️ WARN ({POINTS_PASS_DELTA} < delta ≤ {POINTS_WARN_DELTA}) | {n_warn} | {_pct(n_warn, n_seasons)} |",
+        f"| ❌ FAIL (delta > {POINTS_WARN_DELTA}) | {n_fail} | {_pct(n_fail, n_seasons)} |",
+        "",
+        f"**Scorecard result:** {_badge(scorecard_pass)}  "
+        f"_(fails only on delta > {POINTS_WARN_DELTA})_",
+        "",
+        "### Per-Season Detail",
+        "",
+        "| Season | Driver Total | Constructor Total | Delta | Result |",
+        "|-------:|-------------:|------------------:|------:|:------:|",
+    ]
+
+    for _, row in recon.iterrows():
+        lines.append(
+            f"| {int(row['season'])}"
+            f" | {row['driver_total']:,.1f}"
+            f" | {row['constructor_total']:,.1f}"
+            f" | {row['delta']:.1f}"
+            f" | {row['result']} |"
+        )
+
+    # ── Highlight any WARN / FAIL seasons with guidance ────────────────────
+    bad_seasons = recon[recon["result"] != "✅ PASS"]
+    if not bad_seasons.empty:
+        lines += ["", "### Investigation Notes", ""]
+        for _, row in bad_seasons.iterrows():
+            severity_label = "⚠️ WARN" if row["result"] == "⚠️ WARN" else "❌ FAIL"
+            lines += [
+                f"**{int(row['season'])} — {severity_label} (delta = {row['delta']:.1f} pts)**",
+                "",
+                "Common causes to investigate:",
+                "- Car-sharing entries in `driver_race_features` counted twice under"
+                " two different driverIds but once under the constructor",
+                "- Bonus points (fastest lap, pole) present in one table but absent"
+                " from the other due to era-specific scoring rule differences",
+                "- Shared-drive rows included in driver totals but excluded from"
+                " constructor totals (or vice versa)",
+                "- A season present in one feature table but not the other"
+                " (check `outer` join rows with 0 on one side above)",
+                "",
+                "```python",
+                f"# Drill into {int(row['season'])} discrepancy",
+                f"dr  = driver_race_df[driver_race_df['race_year'] == {int(row['season'])}]",
+                f"con = constructor_season_df[constructor_season_df['race_year'] == {int(row['season'])}]",
+                f"print('Driver total   :', dr['points'].sum())",
+                f"print('Constructor total:', con['total_points'].sum())",
+                "```",
+                "",
+            ]
+
+    lines += [
+        "> ℹ️ **WARN seasons are advisory.** Small deltas (2–5 pts) are common in"
+        " pre-1980 seasons due to car-sharing and dropped-scores rules. They do not"
+        " affect model accuracy for post-1990 analysis.",
+    ]
+
+    return "\n".join(lines), scorecard_pass
 
 
 # ── Scorecard ──────────────────────────────────────────────────────────────────
@@ -970,31 +1367,47 @@ def section_scorecard(checks: list[tuple[str, bool]]) -> str:
 
 def generate_report() -> None:
     print("\n── Data Quality Validator ──────────────────────────────")
-    print(f"  Source : {INTERIM_DIR.resolve()}")
-    print(f"  Output : {REPORT_PATH.resolve()}")
+    print(f"  Source (raw) : {INTERIM_DIR.resolve()}")
+    print(f"  Source (feat): {PROCESSED_DIR.resolve()}")
+    print(f"  Output       : {REPORT_PATH.resolve()}")
     print("")
 
-    print("Loading tables...")
+    print("Loading raw tables...")
     tables = load_tables()
+    print("")
+
+    print("Loading feature tables...")
+    feature_tables = load_feature_tables()
     print("")
 
     print("Running checks...")
 
-    s_inventory              = section_inventory(tables)
-    s_nulls, nulls_pass      = section_null_analysis(tables)
-    s_schema, schema_pass    = section_schema_drift(tables)
-    s_fk,     fk_pass        = section_fk_validation(tables)
-    s_dupes,  dupes_pass     = section_duplicate_check(tables)
-    s_lap,    lap_pass       = section_lap_time_validation(tables)
-    s_status, status_pass    = section_status_validation(tables)
+    # ── Raw data checks (sections 1–7) ──────────────────────────────────────
+    s_inventory                      = section_inventory(tables)
+    s_nulls,    nulls_pass           = section_null_analysis(tables)
+    s_schema,   schema_pass          = section_schema_drift(tables)
+    s_fk,       fk_pass              = section_fk_validation(tables)
+    s_dupes,    dupes_pass           = section_duplicate_check(tables)
+    s_lap,      lap_pass             = section_lap_time_validation(tables)
+    s_status,   status_pass          = section_status_validation(tables)
+
+    # ── Feature-level checks (sections 8–10) ────────────────────────────────
+    s_feat_dupes, feat_dupes_pass    = section_feature_duplicate_keys(feature_tables)
+    s_bounds,     bounds_pass        = section_feature_bounds(feature_tables)
+    s_points,     points_pass        = section_points_reconciliation(feature_tables)
 
     scorecard = section_scorecard([
-        ("No unjustified high-null columns",               nulls_pass),
-        ("Schema: all expected columns present",           schema_pass),
-        ("Foreign key integrity",                          fk_pass),
-        ("No unexplained duplicate race-driver records",   dupes_pass),
-        ("Lap time: no corrupt values",                    lap_pass),
-        ("Status integration with results intact",         status_pass),
+        # Raw data checks
+        ("No unjustified high-null columns",                   nulls_pass),
+        ("Schema: all expected columns present",               schema_pass),
+        ("Foreign key integrity",                              fk_pass),
+        ("No unexplained duplicate race-driver records",       dupes_pass),
+        ("Lap time: no corrupt values",                        lap_pass),
+        ("Status integration with results intact",             status_pass),
+        # Feature-level checks
+        ("Feature tables: no duplicate composite keys",        feat_dupes_pass),
+        ("Feature values: no impossible values (FAIL checks)", bounds_pass),
+        ("Points reconciliation: no season delta > 5 pts",     points_pass),
     ])
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1002,8 +1415,10 @@ def generate_report() -> None:
         "# Data Quality Report",
         "",
         f"> **Generated:** {timestamp}  ",
-        f"> **Source:** `{INTERIM_DIR}`  ",
+        f"> **Source (raw):** `{INTERIM_DIR}`  ",
+        f"> **Source (features):** `{PROCESSED_DIR}`  ",
         f"> **Tables loaded:** {len(tables)}  ",
+        f"> **Feature tables loaded:** {sum(v is not None for v in feature_tables.values())} / {len(feature_tables)}  ",
         "",
         _hr("─", 60),
         "",
@@ -1027,6 +1442,9 @@ def generate_report() -> None:
         s_dupes,
         s_lap,
         s_status,
+        s_feat_dupes,
+        s_bounds,
+        s_points,
         footer,
     ])
 

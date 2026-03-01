@@ -233,22 +233,7 @@ def build_merged_dataset(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
     df = tables["results"].copy()
     log.info("  Spine (results):        %d rows", len(df))
 
-    # ── OI-6: is_shared_drive flag ─────────────────────────────────────────
-    # 1950s–60s car-sharing: multiple drivers shared one car in stints.
-    # These appear as duplicate raceId × driverId rows with the same
-    # constructorId but different laps values. Flag all duplicate pairs so
-    # downstream models can exclude or handle them explicitly.
-    # The full era guard (year < 1970) is applied after the races join below;
-    # for now flag all duplicates — the validate_data.py car-sharing classifier
-    # confirms these only exist in pre-1970 races.
-    dupe_mask = df.duplicated(subset=["raceId", "driverId"], keep=False)
-    df["is_shared_drive"] = dupe_mask.astype("int8")
-    n_shared = int(dupe_mask.sum())
-    if n_shared:
-        log.info(
-            "  is_shared_drive: flagged %d rows (%d pairs) as car-sharing duplicates.",
-            n_shared, n_shared - df.duplicated(subset=["raceId", "driverId"]).sum(),
-        )
+
 
     # ── Step 2: + races ─────────────────────────────────────────────────────
     races_cols = ["raceId", "year", "round", "circuitId", "name", "date",
@@ -492,7 +477,7 @@ _CONSTRUCTOR_COLS = [
 _RESULT_COLS = [
     "resultId", "grid", "grid_pit_lane", "position", "positionText", "positionOrder",
     "points", "laps", "milliseconds", "statusId", "status",
-    "is_dnf", "dnf_type", "is_podium", "is_shared_drive",
+    "is_dnf", "dnf_type", "is_podium",
     "fastestLap", "rank", "fastestLapTime_ms", "fastestLapSpeed",
 ]
 _QUALI_COLS = [

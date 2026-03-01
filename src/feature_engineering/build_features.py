@@ -3,12 +3,18 @@ src/feature_engineering/build_features.py
 ------------------------------------------
 Produces the final analysis-ready master race table and loads all
 cleaned tables into a SQLite database for SQL-based analysis.
+Also builds three feature-store parquet files for modelling:
+
+  data/processed/driver_race_features.parquet       (2.1)
+  data/processed/driver_season_features.parquet     (2.2)
+  data/processed/constructor_season_features.parquet(2.3)
 
 Reads:
   data/interim/cleaned_merged_data.csv    (from src/data_processing/04_merge_data.py)
   data/interim/*_clean.csv               (individual cleaned tables)
   sql/schema.sql                         (table DDL + indexes)
   sql/views.sql                          (analytical views)
+  data/processed/f1_database.db          (for parquet building — built in Step 2)
 
 Writes:
   data/processed/master_race_table.csv   — denormalized table, one row
@@ -18,6 +24,9 @@ Writes:
                                                (incl. status lookup)
                                              - master_race_table
                                              - 4 analytical views
+  data/processed/driver_race_features.parquet
+  data/processed/driver_season_features.parquet
+  data/processed/constructor_season_features.parquet
 
 Pipeline position:
   src/data_processing/02_clean_data.py -> src/data_processing/04_merge_data.py -> [THIS FILE]
@@ -82,6 +91,11 @@ MERGED_FILE       = INTERIM_DIR   / "cleaned_merged_data.csv"
 MASTER_TABLE_FILE = PROCESSED_DIR / "master_race_table.csv"
 DB_FILE           = PROCESSED_DIR / "f1_database.db"
 
+# Parquet output paths
+DRIVER_RACE_PARQUET        = PROCESSED_DIR / "driver_race_features.parquet"
+DRIVER_SEASON_PARQUET      = PROCESSED_DIR / "driver_season_features.parquet"
+CONSTRUCTOR_SEASON_PARQUET = PROCESSED_DIR / "constructor_season_features.parquet"
+
 
 # ---------------------------------------------------------------------------
 # SQL file paths
@@ -92,9 +106,6 @@ VIEWS_SQL_FILE  = SQL_DIR / "views.sql"
 
 # ---------------------------------------------------------------------------
 # Interim table map
-# Maps SQLite table name -> cleaned CSV filename in data/interim/
-# NOTE: status is intentionally included so SQL queries can join
-# results.statusId -> status.statusId for label lookups.
 # ---------------------------------------------------------------------------
 INTERIM_TABLE_MAP = {
     "circuits":     "circuits_clean.csv",
@@ -105,13 +116,9 @@ INTERIM_TABLE_MAP = {
     "qualifying":   "qualifying_clean.csv",
     "lap_times":    "lap_times_clean.csv",
     "pit_stops":    "pit_stops_clean.csv",
-    "status":       "status_clean.csv",     # ← was missing; needed for label joins
+    "status":       "status_clean.csv",
 }
 
-
-# ===========================================================================
-# Step 1: Build master_race_table from cleaned_merged_data.csv
-# ===========================================================================
 
 MASTER_TABLE_COLS = [
     # Race context
@@ -127,7 +134,7 @@ MASTER_TABLE_COLS = [
     # Race result
     "grid", "grid_pit_lane", "position", "positionText", "positionOrder",
     "points", "laps", "milliseconds", "statusId", "status",
-    "is_dnf", "is_podium", "is_shared_drive",
+    "is_dnf", "is_podium",
     "fastestLap", "rank", "fastestLapTime_ms", "fastestLapSpeed",
     # Qualifying
     "quali_position", "q1_ms", "q2_ms", "q3_ms",
@@ -136,35 +143,25 @@ MASTER_TABLE_COLS = [
     # Pit stops (aggregated)
     "total_pit_stops", "total_pit_time_ms",
     "avg_pit_duration_ms", "min_pit_duration_ms",
-    "pit_data_incomplete",   # OI-5: 1 if >30% of pit stop durations are null for this race
+    "pit_data_incomplete",
     # Lap times (aggregated)
     "laps_completed", "avg_lap_time_ms", "median_lap_time_ms",
     "std_lap_time_ms", "fastest_lap_ms", "lap_time_consistency",
 ]
 
 
+# ===========================================================================
+# Step 1: Build master_race_table
+# ===========================================================================
+
 def _recompute_status_flags(df: pd.DataFrame) -> pd.DataFrame:
     """
     Recompute is_dnf and dnf_type from the 'status' label column.
-
-    This is the authoritative derivation — it uses the shared classifier
-    from constants.py and is independent of whatever flag was set in
-    clean_data.py. It also cross-validates against the pre-existing
-    is_dnf column and logs any discrepancies so data quality issues
-    in upstream cleaning are surfaced immediately.
-
-    Columns written:
-      is_dnf    (int8)  : 1 if driver did not finish, 0 otherwise
-      dnf_type  (str)   : 'mechanical' | 'crash' | 'other' | None
-
-    Requires 'status' column to be present in df. If absent, falls back
-    to the existing is_dnf column and logs a warning.
     """
     if "status" not in df.columns:
         log.warning(
             "  'status' column not found in merged data. "
-            "is_dnf will NOT be recomputed — using pre-existing flag as-is. "
-            "Ensure merge_data.py joins the status table correctly."
+            "is_dnf will NOT be recomputed — using pre-existing flag as-is."
         )
         if "dnf_type" not in df.columns:
             df["dnf_type"] = None
@@ -172,43 +169,34 @@ def _recompute_status_flags(df: pd.DataFrame) -> pd.DataFrame:
 
     log.info("  Recomputing is_dnf and dnf_type from status label...")
 
-    # ── Recompute from status text ──────────────────────────────────────────
-    is_dnf_recomputed = compute_is_dnf_series(df["status"])
+    is_dnf_recomputed   = compute_is_dnf_series(df["status"])
     dnf_type_recomputed = compute_dnf_type_series(df["status"])
 
-    # ── Cross-validate against pre-existing is_dnf flag ────────────────────
     if "is_dnf" in df.columns:
-        existing = pd.to_numeric(df["is_dnf"], errors="coerce").fillna(-1).astype(int)
+        existing   = pd.to_numeric(df["is_dnf"], errors="coerce").fillna(-1).astype(int)
         recomputed = is_dnf_recomputed.astype(int)
-
-        # Only compare rows where both values are 0 or 1 (skip -1 = was null)
         comparable = existing.isin([0, 1])
         mismatches = (existing[comparable] != recomputed[comparable]).sum()
 
         if mismatches > 0:
             log.warning(
                 "  ⚠ is_dnf MISMATCH: %d rows differ between "
-                "pre-existing flag (clean_data.py) and status-derived value. "
-                "Status-derived value will be used — review clean_data.py if unexpected.",
+                "pre-existing flag and status-derived value. "
+                "Status-derived value will be used.",
                 mismatches,
             )
-            # Sample the mismatches for debugging
             mismatch_mask = comparable & (existing != recomputed)
             sample = df.loc[mismatch_mask, ["raceId", "driverId", "status"]].head(10)
             log.warning("  Sample mismatched rows:\n%s", sample.to_string(index=False))
         else:
             log.info("  ✓ is_dnf cross-validation passed — no discrepancies.")
 
-    # ── Write authoritative values ──────────────────────────────────────────
     df["is_dnf"]   = is_dnf_recomputed
     df["dnf_type"] = dnf_type_recomputed
 
-    # ── Status category summary ─────────────────────────────────────────────
     n_total    = len(df)
     n_finished = int((~is_dnf_recomputed.astype(bool)).sum())
     n_dnf      = int(is_dnf_recomputed.sum())
-
-    # Count by dnf_type
     dnf_type_counts = dnf_type_recomputed.value_counts(dropna=True)
 
     log.info(
@@ -219,7 +207,6 @@ def _recompute_status_flags(df: pd.DataFrame) -> pd.DataFrame:
     for dtype, count in dnf_type_counts.items():
         log.info("    DNF type %-12s : %d (%.1f%% of DNFs)", dtype, count, count / n_dnf * 100)
 
-    # Warn if the 'Other' unclassified bucket is unexpectedly large
     other_dnf = int(dnf_type_counts.get("other", 0))
     if n_dnf > 0 and other_dnf / n_dnf > 0.25:
         log.warning(
@@ -234,20 +221,6 @@ def _recompute_status_flags(df: pd.DataFrame) -> pd.DataFrame:
 def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
     """
     Load cleaned_merged_data.csv and produce the curated master race table.
-
-    Adds derived columns:
-      is_dnf                : recomputed from status label (authoritative)
-      dnf_type              : 'mechanical' | 'crash' | 'other' | None
-      grid_vs_finish_delta  : grid - position (positive = gained places)
-      is_points_finish      : 1 if points > 0
-      is_winner             : 1 if position == 1
-      constructor_season_key: constructorRef_year (era-aware grouping key)
-
-    Args:
-        merged_path: Path to cleaned_merged_data.csv
-
-    Returns:
-        Curated master race table DataFrame.
     """
     if not merged_path.exists():
         raise FileNotFoundError(
@@ -259,17 +232,8 @@ def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
     df = pd.read_csv(merged_path, low_memory=False)
     log.info("  Loaded: %d rows x %d columns", *df.shape)
 
-    # -----------------------------------------------------------------------
-    # Status-derived flags (authoritative — replaces clean_data.py flags)
-    # -----------------------------------------------------------------------
     df = _recompute_status_flags(df)
 
-    # -----------------------------------------------------------------------
-    # Remaining derived columns
-    # -----------------------------------------------------------------------
-
-    # grid_vs_finish_delta: positive = gained positions from grid to finish.
-    # Only populated for classified finishers (position not null).
     df["grid_vs_finish_delta"] = np.where(
         df["grid"].notna() & df["position"].notna(),
         pd.to_numeric(df["grid"], errors="coerce") -
@@ -277,20 +241,7 @@ def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
         np.nan,
     )
 
-    # ── OI-5: pit_data_incomplete flag ─────────────────────────────────────────
-    # Some races have >30% of individual pit stop duration entries as null due
-    # to partial data feed failures in the Kaggle source
-    # (e.g. 2023 Australian GP: 70.8% null, 2021 Saudi GP: 74.5% null).
-    # These races are unreliable for pit stop strategy analysis.
-    # Flag them at the driver-race level so models can filter:
-    #   WHERE pit_data_incomplete = 0
-    #
-    # FIX (2026-03-01): The previous proxy (fraction of drivers with fully-null
-    # avg_pit_duration_ms) was too conservative — for races where 40-58% of
-    # individual stops are null, many drivers still had >= 1 valid stop, so
-    # avg_pit_duration_ms was not null and those races were missed.
-    # Correct approach: load pit_stops_clean.csv and compute null rate at
-    # individual stop level per race.
+    # OI-5: pit_data_incomplete flag (stop-level null rate)
     pit_incomplete_race_ids: set = set()
     pit_stops_path = INTERIM_DIR / "pit_stops_clean.csv"
     if pit_stops_path.exists():
@@ -308,14 +259,8 @@ def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
                 pit_race_stats[pit_race_stats["null_rate"] > 0.30].index
             )
             log.info(
-                "  pit_data_incomplete: %d races have >30%% null pit duration "
-                "(stop-level calculation from pit_stops_clean.csv).",
+                "  pit_data_incomplete: %d races flagged >30%% null pit duration.",
                 len(pit_incomplete_race_ids),
-            )
-        else:
-            log.warning(
-                "  pit_data_incomplete: pit_stops_clean.csv missing required columns. "
-                "Flag will be 0 for all rows."
             )
     else:
         log.warning(
@@ -323,38 +268,30 @@ def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
             "Flag will be 0 for all rows.", pit_stops_path,
         )
 
-    df["pit_data_incomplete"] = (
-        df["raceId"].isin(pit_incomplete_race_ids).astype("int8")
-    )
+    df["pit_data_incomplete"] = df["raceId"].isin(pit_incomplete_race_ids).astype("int8")
+
     n_incomplete_rows  = int(df["pit_data_incomplete"].eq(1).sum())
     n_incomplete_races = int(df[df["pit_data_incomplete"] == 1]["raceId"].nunique())
     if n_incomplete_rows:
         log.info(
-            "  pit_data_incomplete: flagged %d driver-race rows across %d races. "
-            "Exclude from pit stop strategy models (WHERE pit_data_incomplete = 0).",
+            "  pit_data_incomplete: flagged %d driver-race rows across %d races.",
             n_incomplete_rows, n_incomplete_races,
         )
 
-    # is_points_finish: any points scored in this race
     df["is_points_finish"] = (
         pd.to_numeric(df["points"], errors="coerce").fillna(0) > 0
     ).astype("int8")
 
-    # is_winner: finished in P1
     df["is_winner"] = (
         pd.to_numeric(df["position"], errors="coerce").eq(1)
     ).astype("int8")
 
-    # constructor_season_key: used for era-aware team grouping
     df["constructor_season_key"] = (
         df["constructorRef"].fillna("unknown").astype(str)
         + "_"
         + df["year"].astype(str)
     )
 
-    # -----------------------------------------------------------------------
-    # Select and order final columns
-    # -----------------------------------------------------------------------
     extra_cols = [
         "dnf_type", "grid_vs_finish_delta",
         "is_points_finish", "is_winner", "constructor_season_key",
@@ -364,16 +301,12 @@ def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
     missing = [c for c in MASTER_TABLE_COLS if c not in df.columns]
     if missing:
         log.warning(
-            "  %d expected columns absent from merged data "
-            "(likely pre-modern era NULLs): %s",
+            "  %d expected columns absent from merged data: %s",
             len(missing), missing,
         )
 
     df = df[[c for c in final_cols if c in df.columns]].copy()
 
-    # -----------------------------------------------------------------------
-    # Type enforcement for SQLite / downstream compatibility
-    # -----------------------------------------------------------------------
     for col in ["date", "dob"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%Y-%m-%d")
@@ -383,7 +316,7 @@ def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
         "grid", "grid_pit_lane", "position", "positionOrder", "laps", "statusId",
         "fastestLap", "rank", "quali_position", "total_pit_stops", "laps_completed",
         "is_dnf", "is_podium", "is_winner", "is_points_finish",
-        "is_shared_drive", "pit_data_incomplete",
+        "pit_data_incomplete",
     ]
     for col in int_cols:
         if col in df.columns:
@@ -413,10 +346,7 @@ def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
 
 def _read_sql_file(path: Path) -> str:
     if not path.exists():
-        raise FileNotFoundError(
-            f"SQL file not found: {path}\n"
-            f"Ensure the sql/ directory is present at the project root."
-        )
+        raise FileNotFoundError(f"SQL file not found: {path}")
     return path.read_text(encoding="utf-8")
 
 
@@ -426,32 +356,18 @@ def load_tables_to_sqlite(
     db_path: Path,
 ) -> None:
     """
-    Initialise the SQLite database and load all tables.
-
-    Steps:
-      1. Apply schema from sql/schema.sql  (CREATE TABLE + indexes)
-      2. Load all 9 individual cleaned CSVs (incl. status lookup table)
-      3. Load master_race_table
-      4. Apply views from sql/views.sql
-
-    The status table is a first-class lookup in the DB — SQL queries
-    can now JOIN results.statusId -> status.statusId to get the label,
-    or JOIN master_race_table.statusId -> status.statusId for the same.
-
-    The operation is idempotent — safe to re-run (tables are replaced).
+    Initialise the SQLite database and load all tables + views.
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     log.info("Connected to SQLite: %s", db_path)
 
-    # Step 1: Schema DDL
     log.info("Applying schema from %s ...", SCHEMA_SQL_FILE)
     schema_sql = _read_sql_file(SCHEMA_SQL_FILE)
     conn.executescript(schema_sql)
     conn.commit()
     log.info("  Schema applied.")
 
-    # Step 2: Load individual cleaned tables
     log.info("Loading cleaned source tables...")
     for table_name, csv_name in INTERIM_TABLE_MAP.items():
         csv_path = interim_dir / csv_name
@@ -462,11 +378,9 @@ def load_tables_to_sqlite(
         df.to_sql(table_name, conn, if_exists="replace", index=False)
         log.info("  Loaded  %-20s  %d rows", table_name, len(df))
 
-    # Step 3: Load master race table
     master_df.to_sql("master_race_table", conn, if_exists="replace", index=False)
     log.info("  Loaded  %-20s  %d rows", "master_race_table", len(master_df))
 
-    # Step 4: Analytical views
     log.info("Creating views from %s ...", VIEWS_SQL_FILE)
     views_sql = _read_sql_file(VIEWS_SQL_FILE)
     conn.executescript(views_sql)
@@ -479,9 +393,7 @@ def load_tables_to_sqlite(
 
 def verify_database(db_path: Path) -> None:
     """
-    Run a quick sanity check on the loaded database.
-    Prints row counts for all tables and confirms views exist.
-    Also verifies status table is present and joinable.
+    Sanity-check the loaded database — row counts, views, status FK join.
     """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -508,7 +420,6 @@ def verify_database(db_path: Path) -> None:
 
     print("=" * 55)
 
-    # Verify status table is present and FK join works
     if "status" in loaded_tables and "results" in loaded_tables:
         orphan_check = cursor.execute(
             "SELECT COUNT(*) FROM results r "
@@ -520,7 +431,6 @@ def verify_database(db_path: Path) -> None:
         else:
             print(f"  ⚠ status FK join: {orphan_check} orphan statusId in results")
 
-        # Show top DNF causes using the actual status table join
         print("\n  Top 5 DNF causes (from status join):")
         top_dnf = cursor.execute(
             "SELECT s.status, COUNT(*) as cnt "
@@ -539,6 +449,415 @@ def verify_database(db_path: Path) -> None:
 
 
 # ===========================================================================
+# Step 3: Build parquet feature stores
+# ===========================================================================
+
+def _connect_db(db_path: Path) -> sqlite3.Connection:
+    """Open a read-only-style connection to the SQLite database."""
+    if not db_path.exists():
+        raise FileNotFoundError(
+            f"Database not found: {db_path}\n"
+            f"Run the main pipeline first so f1_database.db is built."
+        )
+    return sqlite3.connect(db_path)
+
+
+# ---------------------------------------------------------------------------
+# 2.1  Driver–Race features
+# ---------------------------------------------------------------------------
+
+def build_driver_race_features(db_path: Path = DB_FILE) -> pd.DataFrame:
+    """
+    Build driver_race_features.parquet — one row per driver per race.
+
+    Reads master_race_table from SQLite and pulls pit stop counts from
+    the pit_stops table directly so the aggregation is always fresh.
+
+    Columns produced
+    ----------------
+    Keys            : raceId, driverId
+    Race context    : race_year, round, circuitId
+    Identity        : constructorId
+    Grid / result   : grid, finish_position, positions_gained
+    Points / flags  : points, is_dnf, is_podium, is_winner, is_points_finish
+    Performance     : fastest_lap_rank, qualifying_position, qualifying_gap_ms
+                      best_quali_ms, avg_lap_time_ms, lap_time_consistency
+    Pit stops       : pit_stop_count, total_pit_time_ms, avg_pit_duration_ms
+                      pit_data_incomplete
+    """
+    log.info("Building driver_race_features ...")
+    conn = _connect_db(db_path)
+
+    # ── Core pull from master_race_table ────────────────────────────────────
+    master_query = """
+        SELECT
+            m.raceId,
+            m.driverId,
+            m.constructorId,
+            m.year          AS race_year,
+            m.round,
+            m.circuitId,
+
+            -- Grid / result
+            m.grid,
+            m.position      AS finish_position,
+            m.positionOrder AS finish_position_order,
+
+            -- Points and status flags
+            m.points,
+            m.is_dnf,
+            m.is_podium,
+            m.is_winner,
+            m.is_points_finish,
+            m.statusId,
+
+            -- Performance metrics
+            m.rank                  AS fastest_lap_rank,
+            m.quali_position        AS qualifying_position,
+            m.qualifying_gap_ms,
+            m.best_quali_ms,
+            m.avg_lap_time_ms,
+            m.lap_time_consistency,
+            m.fastest_lap_ms,
+
+            -- Pre-aggregated pit stop columns from master (fallback)
+            m.total_pit_stops       AS pit_stop_count_master,
+            m.total_pit_time_ms     AS total_pit_time_ms_master,
+            m.avg_pit_duration_ms   AS avg_pit_duration_ms_master,
+            m.pit_data_incomplete
+        FROM master_race_table m
+    """
+    mdf = pd.read_sql_query(master_query, conn)
+    log.info("  master_race_table pulled: %d rows", len(mdf))
+
+    # ── Fresh pit stop aggregation from raw pit_stops table ─────────────────
+    # Prefer this over master pre-aggregated values — it's always up-to-date
+    # and lets us count stops precisely even when duration is null.
+    pit_query = """
+        SELECT
+            raceId,
+            driverId,
+            COUNT(*)                    AS pit_stop_count,
+            SUM(pit_duration_ms)        AS total_pit_time_ms,
+            AVG(pit_duration_ms)        AS avg_pit_duration_ms
+        FROM pit_stops
+        GROUP BY raceId, driverId
+    """
+    try:
+        pit_agg = pd.read_sql_query(pit_query, conn)
+        log.info("  pit_stops aggregated: %d driver-race rows", len(pit_agg))
+        pit_available = True
+    except Exception as exc:
+        log.warning("  pit_stops table unavailable (%s) — using master columns.", exc)
+        pit_available = False
+
+    conn.close()
+
+    # ── Merge pit aggregates onto master ────────────────────────────────────
+    if pit_available:
+        df = mdf.merge(pit_agg, on=["raceId", "driverId"], how="left")
+        # Fresh aggregation takes priority; fill gaps with master pre-agg
+        df["pit_stop_count"]    = df["pit_stop_count"].fillna(df["pit_stop_count_master"])
+        df["total_pit_time_ms"] = df["total_pit_time_ms"].fillna(df["total_pit_time_ms_master"])
+        df["avg_pit_duration_ms"] = df["avg_pit_duration_ms"].fillna(df["avg_pit_duration_ms_master"])
+    else:
+        df = mdf.copy()
+        df["pit_stop_count"]    = df["pit_stop_count_master"]
+        df["total_pit_time_ms"] = df["total_pit_time_ms_master"]
+        df["avg_pit_duration_ms"] = df["avg_pit_duration_ms_master"]
+
+    # ── Derived: positions gained ────────────────────────────────────────────
+    # Positive = moved forward; null grid or DNF → NaN
+    df["positions_gained"] = np.where(
+        df["grid"].notna() & df["finish_position"].notna() & (df["grid"] > 0),
+        df["grid"] - df["finish_position"],
+        np.nan,
+    )
+
+    # ── Final column selection and type tidy ────────────────────────────────
+    keep = [
+        "raceId", "driverId", "constructorId",
+        "race_year", "round", "circuitId",
+        "grid", "finish_position", "finish_position_order", "positions_gained",
+        "points", "is_dnf", "is_podium", "is_winner", "is_points_finish",
+        "fastest_lap_rank", "qualifying_position", "qualifying_gap_ms",
+        "best_quali_ms", "avg_lap_time_ms", "lap_time_consistency", "fastest_lap_ms",
+        "pit_stop_count", "total_pit_time_ms", "avg_pit_duration_ms",
+        "pit_data_incomplete",
+    ]
+    df = df[[c for c in keep if c in df.columns]].copy()
+
+    int_cols = [
+        "raceId", "driverId", "constructorId",
+        "race_year", "round", "circuitId",
+        "grid", "finish_position", "finish_position_order",
+        "is_dnf", "is_podium", "is_winner", "is_points_finish",
+        "fastest_lap_rank", "qualifying_position", "pit_stop_count", "pit_data_incomplete",
+    ]
+    float_cols = [
+        "points", "positions_gained", "qualifying_gap_ms", "best_quali_ms",
+        "avg_lap_time_ms", "lap_time_consistency", "fastest_lap_ms",
+        "total_pit_time_ms", "avg_pit_duration_ms",
+    ]
+    for col in int_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in float_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    log.info("  driver_race_features: %d rows x %d cols", *df.shape)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 2.2  Driver–Season aggregates
+# ---------------------------------------------------------------------------
+
+def build_driver_season_features(
+    driver_race_df: pd.DataFrame | None = None,
+    db_path: Path = DB_FILE,
+) -> pd.DataFrame:
+    """
+    Build driver_season_features.parquet — one row per driver per season.
+
+    All aggregates are derived exclusively from driver_race_features so the
+    dependency chain is explicit and reproducible.
+
+    Columns produced
+    ----------------
+    Keys         : driverId, race_year
+    Volume       : races_entered, races_classified
+    Results      : avg_finish_position, median_finish_position
+                   best_finish, worst_finish, finish_std_dev
+    Points       : total_points, points_per_race, points_per_classified_race
+    Flags        : wins, podiums, points_finishes
+                   win_rate, podium_rate, points_finish_rate, dnf_rate
+    Pace         : avg_positions_gained, avg_qualifying_position
+                   avg_qualifying_gap_ms, avg_lap_time_ms
+    Consistency  : avg_lap_time_consistency
+    Pit          : avg_pit_stop_count, avg_pit_duration_ms
+    """
+    log.info("Building driver_season_features ...")
+
+    if driver_race_df is None:
+        log.info("  driver_race_df not supplied — loading from DB.")
+        driver_race_df = build_driver_race_features(db_path)
+
+    df = driver_race_df.copy()
+    g  = df.groupby(["driverId", "race_year"])
+
+    # ── Volume ───────────────────────────────────────────────────────────────
+    agg = g.agg(
+        races_entered          = ("raceId",            "count"),
+        races_classified       = ("finish_position",   "count"),  # non-null = classified
+    ).reset_index()
+
+    # ── Finish position stats (classified finishers only) ───────────────────
+    fin = df[df["finish_position"].notna()].groupby(["driverId", "race_year"])
+    agg = agg.merge(
+        fin.agg(
+            avg_finish_position    = ("finish_position", "mean"),
+            median_finish_position = ("finish_position", "median"),
+            best_finish            = ("finish_position", "min"),
+            worst_finish           = ("finish_position", "max"),
+            finish_std_dev         = ("finish_position", "std"),
+        ).reset_index(),
+        on=["driverId", "race_year"], how="left",
+    )
+
+    # ── Points ───────────────────────────────────────────────────────────────
+    pts = g.agg(total_points=("points", "sum")).reset_index()
+    agg = agg.merge(pts, on=["driverId", "race_year"], how="left")
+    agg["points_per_race"]             = agg["total_points"] / agg["races_entered"]
+    agg["points_per_classified_race"]  = np.where(
+        agg["races_classified"] > 0,
+        agg["total_points"] / agg["races_classified"],
+        np.nan,
+    )
+
+    # ── Wins / podiums / points finishes / DNFs ──────────────────────────────
+    flag_agg = g.agg(
+        wins           = ("is_winner",        "sum"),
+        podiums        = ("is_podium",         "sum"),
+        points_finishes= ("is_points_finish",  "sum"),
+        dnfs           = ("is_dnf",            "sum"),
+    ).reset_index()
+    agg = agg.merge(flag_agg, on=["driverId", "race_year"], how="left")
+
+    agg["win_rate"]           = agg["wins"]            / agg["races_entered"]
+    agg["podium_rate"]        = agg["podiums"]          / agg["races_entered"]
+    agg["points_finish_rate"] = agg["points_finishes"]  / agg["races_entered"]
+    agg["dnf_rate"]           = agg["dnfs"]             / agg["races_entered"]
+
+    # ── Qualifying / pace ────────────────────────────────────────────────────
+    pace_agg = g.agg(
+        avg_positions_gained   = ("positions_gained",    "mean"),
+        avg_qualifying_position= ("qualifying_position", "mean"),
+        avg_qualifying_gap_ms  = ("qualifying_gap_ms",   "mean"),
+        avg_lap_time_ms        = ("avg_lap_time_ms",     "mean"),
+        avg_lap_time_consistency=("lap_time_consistency","mean"),
+    ).reset_index()
+    agg = agg.merge(pace_agg, on=["driverId", "race_year"], how="left")
+
+    # ── Pit stops (exclude incomplete-data races) ────────────────────────────
+    pit_df = df[df["pit_data_incomplete"] != 1]
+    if len(pit_df) > 0:
+        pit_agg_season = pit_df.groupby(["driverId", "race_year"]).agg(
+            avg_pit_stop_count  = ("pit_stop_count",    "mean"),
+            avg_pit_duration_ms = ("avg_pit_duration_ms","mean"),
+        ).reset_index()
+        agg = agg.merge(pit_agg_season, on=["driverId", "race_year"], how="left")
+    else:
+        agg["avg_pit_stop_count"]   = np.nan
+        agg["avg_pit_duration_ms"]  = np.nan
+
+    log.info("  driver_season_features: %d rows x %d cols", *agg.shape)
+    return agg
+
+
+# ---------------------------------------------------------------------------
+# 2.3  Constructor–Season aggregates
+# ---------------------------------------------------------------------------
+
+def build_constructor_season_features(
+    driver_race_df: pd.DataFrame | None = None,
+    db_path: Path = DB_FILE,
+) -> pd.DataFrame:
+    """
+    Build constructor_season_features.parquet — one row per constructor per season.
+
+    Includes driver performance spread metrics: the gap between the team's
+    two drivers across avg finish position, points, and DNF rate, giving a
+    signal for intra-team competitiveness vs. car dominance.
+
+    Columns produced
+    ----------------
+    Keys           : constructorId, race_year
+    Volume         : races_entered, driver_count (distinct drivers used)
+    Results        : avg_finish_position, best_finish, finish_std_dev
+    Points         : total_points, points_per_race, avg_driver_points
+    Flags          : total_wins, total_podiums, total_dnfs
+                     win_rate, podium_rate, dnf_rate
+    Pit            : avg_pit_stop_count, avg_pit_duration_ms (clean races only)
+    Driver spread  : driver_spread_avg_finish   (max − min avg finish pos)
+                     driver_spread_total_points (max − min total points)
+                     driver_spread_dnf_rate     (max − min DNF rate)
+                     top_driver_driverId        (driver with most points this season)
+    """
+    log.info("Building constructor_season_features ...")
+
+    if driver_race_df is None:
+        log.info("  driver_race_df not supplied — loading from DB.")
+        driver_race_df = build_driver_race_features(db_path)
+
+    df  = driver_race_df.copy()
+    g   = df.groupby(["constructorId", "race_year"])
+
+    # ── Volume ───────────────────────────────────────────────────────────────
+    agg = g.agg(
+        races_entered  = ("raceId",    "count"),
+        driver_count   = ("driverId",  "nunique"),
+    ).reset_index()
+
+    # ── Finish position ───────────────────────────────────────────────────────
+    fin = df[df["finish_position"].notna()].groupby(["constructorId", "race_year"])
+    agg = agg.merge(
+        fin.agg(
+            avg_finish_position = ("finish_position", "mean"),
+            best_finish         = ("finish_position", "min"),
+            finish_std_dev      = ("finish_position", "std"),
+        ).reset_index(),
+        on=["constructorId", "race_year"], how="left",
+    )
+
+    # ── Points ────────────────────────────────────────────────────────────────
+    pts = g.agg(total_points=("points", "sum")).reset_index()
+    agg = agg.merge(pts, on=["constructorId", "race_year"], how="left")
+    agg["points_per_race"]   = agg["total_points"] / agg["races_entered"]
+    agg["avg_driver_points"] = agg["total_points"] / agg["driver_count"]
+
+    # ── Wins / podiums / DNFs ─────────────────────────────────────────────────
+    flag_agg = g.agg(
+        total_wins   = ("is_winner", "sum"),
+        total_podiums= ("is_podium", "sum"),
+        total_dnfs   = ("is_dnf",   "sum"),
+    ).reset_index()
+    agg = agg.merge(flag_agg, on=["constructorId", "race_year"], how="left")
+    agg["win_rate"]    = agg["total_wins"]    / agg["races_entered"]
+    agg["podium_rate"] = agg["total_podiums"] / agg["races_entered"]
+    agg["dnf_rate"]    = agg["total_dnfs"]    / agg["races_entered"]
+
+    # ── Pit stops (clean races only) ──────────────────────────────────────────
+    pit_df = df[df["pit_data_incomplete"] != 1]
+    if len(pit_df) > 0:
+        pit_agg = pit_df.groupby(["constructorId", "race_year"]).agg(
+            avg_pit_stop_count  = ("pit_stop_count",     "mean"),
+            avg_pit_duration_ms = ("avg_pit_duration_ms","mean"),
+        ).reset_index()
+        agg = agg.merge(pit_agg, on=["constructorId", "race_year"], how="left")
+    else:
+        agg["avg_pit_stop_count"]   = np.nan
+        agg["avg_pit_duration_ms"]  = np.nan
+
+    # ── Driver performance spread ─────────────────────────────────────────────
+    # Compute per-driver per-season summaries, then diff within each constructor
+    driver_season = (
+        df.groupby(["constructorId", "race_year", "driverId"])
+        .agg(
+            drv_avg_finish = ("finish_position", "mean"),
+            drv_points     = ("points",          "sum"),
+            drv_dnf_rate   = ("is_dnf",          "mean"),
+        )
+        .reset_index()
+    )
+
+    def _spread(series: pd.Series) -> float:
+        """max − min across drivers; NaN if fewer than 2 drivers have valid data."""
+        valid = series.dropna()
+        return float(valid.max() - valid.min()) if len(valid) >= 2 else np.nan
+
+    def _top_driver(sub: pd.DataFrame) -> float:
+        """driverId of the driver with the most points this season."""
+        if sub.empty:
+            return np.nan
+        return float(sub.loc[sub["drv_points"].idxmax(), "driverId"])
+
+    spread = (
+        driver_season
+        .groupby(["constructorId", "race_year"])
+        .apply(
+            lambda s: pd.Series({
+                "driver_spread_avg_finish"   : _spread(s["drv_avg_finish"]),
+                "driver_spread_total_points" : _spread(s["drv_points"]),
+                "driver_spread_dnf_rate"     : _spread(s["drv_dnf_rate"]),
+                "top_driver_driverId"        : _top_driver(s),
+            })
+        )
+        .reset_index()
+    )
+    agg = agg.merge(spread, on=["constructorId", "race_year"], how="left")
+
+    log.info("  constructor_season_features: %d rows x %d cols", *agg.shape)
+    return agg
+
+
+# ---------------------------------------------------------------------------
+# Parquet save helper
+# ---------------------------------------------------------------------------
+
+def _save_parquet(df: pd.DataFrame, path: Path, label: str) -> None:
+    """Save DataFrame to parquet with basic validation logging."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, index=False, engine="pyarrow")
+    size_kb = path.stat().st_size / 1024
+    log.info(
+        "  Saved %-45s  %d rows  %d cols  %.1f KB",
+        str(path), len(df), len(df.columns), size_kb,
+    )
+
+
+# ===========================================================================
 # Orchestrator
 # ===========================================================================
 
@@ -551,13 +870,12 @@ def run_build_master_table(
     """
     Full pipeline:
       1. Build master_race_table from cleaned_merged_data.csv
-         - Recomputes is_dnf and dnf_type from status label (authoritative)
-         - Cross-validates against pre-existing is_dnf from clean_data.py
       2. Save to data/processed/master_race_table.csv
       3. Load all 9 cleaned tables (incl. status) into SQLite
       4. Load master_race_table into SQLite
       5. Create analytical views
       6. Verify database and status FK join
+      7. Build and save the three parquet feature stores
     """
     processed_dir.mkdir(parents=True, exist_ok=True)
 
@@ -580,11 +898,30 @@ def run_build_master_table(
     verify_database(db_file)
 
     log.info("=" * 55)
-    log.info("build_master_table.py complete.")
-    log.info("  master_race_table.csv  -> %s", master_table_file)
-    log.info("  f1_database.db         -> %s", db_file)
-    log.info("  SQL schema             -> %s", SCHEMA_SQL_FILE)
-    log.info("  SQL views              -> %s", VIEWS_SQL_FILE)
+    log.info("STEP 4  Building parquet feature stores")
+    log.info("=" * 55)
+
+    # 2.1 — Driver–Race (built from DB; shared into season builds)
+    driver_race_df = build_driver_race_features(db_file)
+    _save_parquet(driver_race_df, DRIVER_RACE_PARQUET, "driver_race_features")
+
+    # 2.2 — Driver–Season (derived from driver_race_df — no extra DB read)
+    driver_season_df = build_driver_season_features(driver_race_df, db_file)
+    _save_parquet(driver_season_df, DRIVER_SEASON_PARQUET, "driver_season_features")
+
+    # 2.3 — Constructor–Season (derived from driver_race_df — no extra DB read)
+    constructor_season_df = build_constructor_season_features(driver_race_df, db_file)
+    _save_parquet(constructor_season_df, CONSTRUCTOR_SEASON_PARQUET, "constructor_season_features")
+
+    log.info("=" * 55)
+    log.info("build_features.py complete.")
+    log.info("  master_race_table.csv          -> %s", master_table_file)
+    log.info("  f1_database.db                 -> %s", db_file)
+    log.info("  driver_race_features.parquet   -> %s", DRIVER_RACE_PARQUET)
+    log.info("  driver_season_features.parquet -> %s", DRIVER_SEASON_PARQUET)
+    log.info("  constructor_season.parquet     -> %s", CONSTRUCTOR_SEASON_PARQUET)
+    log.info("  SQL schema                     -> %s", SCHEMA_SQL_FILE)
+    log.info("  SQL views                      -> %s", VIEWS_SQL_FILE)
     return master_df
 
 
