@@ -1,6 +1,6 @@
 # F1 Data Quality — Diagnostics Report
 
-> **Generated:** 2026-03-01 13:45:26  
+> **Generated:** 2026-03-01 17:14:12  
 > **Database:** `data\processed\f1_database.db`  
 > **Purpose:** Classify each scorecard failure as DATA issue or SCRIPT issue
 
@@ -772,7 +772,7 @@ If grid_pit_lane = 0 for all post-1995 null-grid rows → merge step not run yet
 | era | grid_pit_lane | row_count |
 | --- | --- | --- |
 | historic (<1996) | 0 | 1,538 |
-| modern (>=1996) | 0 | 100 |
+| modern (>=1996) | 1 | 100 |
 
 ---
 
@@ -789,13 +789,13 @@ Pre-1996 rows with points AND grid_pit_lane = 1 → era-guard bug in merge_data.
 
 | year | grid_pit_lane | null_grid_rows_with_points | total_points |
 | --- | --- | --- | --- |
-| 2,015 | 0 | 1 | 1 |
-| 2,019 | 0 | 4 | 13 |
-| 2,020 | 0 | 1 | 1 |
-| 2,021 | 0 | 2 | 14 |
-| 2,022 | 0 | 2 | 3 |
-| 2,023 | 0 | 3 | 18 |
-| 2,024 | 0 | 1 | 2 |
+| 2,015 | 1 | 1 | 1 |
+| 2,019 | 1 | 4 | 13 |
+| 2,020 | 1 | 1 | 1 |
+| 2,021 | 1 | 2 | 14 |
+| 2,022 | 1 | 2 | 3 |
+| 2,023 | 1 | 3 | 18 |
+| 2,024 | 1 | 1 | 2 |
 
 ---
 
@@ -843,8 +843,52 @@ If rows remain → positionText override in merge_data.py did not run.
 Expected: all rows with is_shared_drive = 1 have race year < 1970.
 If is_shared_drive = 1 appears in modern years → flag logic too broad.
 
-> ⚠️ **Query failed:** `no such column: r.is_shared_drive`  
-> Check that the database schema matches expectations.
+**Results:** 42 rows
+
+| year | race_name | shared_drive_rows | distinct_drivers |
+| --- | --- | --- | --- |
+| 1,950 | French Grand Prix | 2 | 1 |
+| 1,950 | Indianapolis 500 | 2 | 1 |
+| 1,950 | Italian Grand Prix | 4 | 2 |
+| 1,951 | French Grand Prix | 6 | 3 |
+| 1,951 | Italian Grand Prix | 2 | 1 |
+| 1,952 | Dutch Grand Prix | 2 | 1 |
+| 1,952 | French Grand Prix | 2 | 1 |
+| 1,952 | Swiss Grand Prix | 2 | 1 |
+| 1,953 | Belgian Grand Prix | 2 | 1 |
+| 1,953 | Dutch Grand Prix | 2 | 1 |
+| 1,953 | German Grand Prix | 4 | 2 |
+| 1,953 | Indianapolis 500 | 18 | 8 |
+| 1,953 | Swiss Grand Prix | 4 | 2 |
+| 1,954 | Belgian Grand Prix | 2 | 1 |
+| 1,954 | British Grand Prix | 2 | 1 |
+| 1,954 | German Grand Prix | 2 | 1 |
+| 1,954 | Indianapolis 500 | 25 | 12 |
+| 1,954 | Italian Grand Prix | 2 | 1 |
+| 1,955 | Argentine Grand Prix | 23 | 10 |
+| 1,955 | Belgian Grand Prix | 2 | 1 |
+| 1,955 | British Grand Prix | 4 | 2 |
+| 1,955 | Monaco Grand Prix | 4 | 2 |
+| 1,956 | Argentine Grand Prix | 2 | 1 |
+| 1,956 | Belgian Grand Prix | 2 | 1 |
+| 1,956 | British Grand Prix | 4 | 2 |
+| 1,956 | French Grand Prix | 6 | 3 |
+| 1,956 | Italian Grand Prix | 6 | 3 |
+| 1,956 | Monaco Grand Prix | 4 | 2 |
+| 1,957 | Argentine Grand Prix | 2 | 1 |
+| 1,957 | British Grand Prix | 6 | 3 |
+| 1,957 | French Grand Prix | 2 | 1 |
+| 1,957 | Italian Grand Prix | 2 | 1 |
+| 1,957 | Monaco Grand Prix | 4 | 2 |
+| 1,958 | French Grand Prix | 2 | 1 |
+| 1,958 | Italian Grand Prix | 2 | 1 |
+| 1,958 | Monaco Grand Prix | 2 | 1 |
+| 1,960 | Argentine Grand Prix | 2 | 1 |
+| 1,961 | British Grand Prix | 2 | 1 |
+| 1,961 | United States Grand Prix | 2 | 1 |
+| 1,962 | British Grand Prix | 2 | 1 |
+| 1,964 | United States Grand Prix | 2 | 1 |
+| 1,978 | Italian Grand Prix | 2 | 1 |
 
 ---
 
@@ -857,13 +901,29 @@ Expected: 2023 Australian GP (70.8% null), 2021 Saudi GP (74.5%),
 2016 Brazilian GP (58.1%) among the flagged races.
 Column only present in master_race_table, not raw results table.
 
-**Results:** 3 rows
+**Results:** 19 rows
 
 | year | round | race_name | pit_data_incomplete | drivers |
 | --- | --- | --- | --- | --- |
+| 2,016 | 1 | Australian Grand Prix | 1 | 22 |
+| 2,016 | 13 | Belgian Grand Prix | 1 | 22 |
+| 2,016 | 20 | Brazilian Grand Prix | 1 | 22 |
+| 2,017 | 8 | Azerbaijan Grand Prix | 1 | 20 |
+| 2,020 | 8 | Italian Grand Prix | 1 | 20 |
+| 2,020 | 9 | Tuscan Grand Prix | 1 | 20 |
+| 2,020 | 15 | Bahrain Grand Prix | 1 | 20 |
+| 2,021 | 2 | Emilia Romagna Grand Prix | 1 | 20 |
+| 2,021 | 6 | Azerbaijan Grand Prix | 1 | 20 |
+| 2,021 | 10 | British Grand Prix | 1 | 20 |
 | 2,021 | 21 | Saudi Arabian Grand Prix | 1 | 20 |
+| 2,022 | 7 | Monaco Grand Prix | 1 | 20 |
+| 2,022 | 10 | British Grand Prix | 1 | 20 |
+| 2,022 | 18 | Japanese Grand Prix | 1 | 20 |
 | 2,023 | 3 | Australian Grand Prix | 1 | 20 |
+| 2,023 | 19 | Mexico City Grand Prix | 1 | 20 |
+| 2,024 | 4 | Japanese Grand Prix | 1 | 20 |
 | 2,024 | 8 | Monaco Grand Prix | 1 | 20 |
+| 2,024 | 21 | São Paulo Grand Prix | 1 | 20 |
 
 ---
 
@@ -893,7 +953,7 @@ resultIds: 327 (Glock/Driver Seat), 1973 (Pizzonia/Launch control),
 ## Summary
 
 - Queries run: **27**
-- Queries failed: **1**
-- Generated: 2026-03-01 13:45:27
+- Queries failed: **0**
+- Generated: 2026-03-01 17:14:13
 
 _Run `validate_data.py` after any fixes to regenerate the main quality report._

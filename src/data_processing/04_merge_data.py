@@ -1,10 +1,10 @@
 """
-src/data/merge_data.py
-----------------------
+src/data_processing/04_merge_data.py
+------------------------------------
 Merges all individually cleaned F1 tables into a single flat dataset.
 
 Reads:
-  data/interim/*_clean.csv  (produced by src/data/clean_data.py)
+  data/interim/*_clean.csv  (produced by src/data_processing/02_clean_data.py)
 
 Writes:
   data/interim/cleaned_merged_data.csv
@@ -12,7 +12,7 @@ Writes:
 This file is the canonical intermediate artifact — it contains one row
 per driver per race with all contextual fields denormalized onto it.
 It is NOT yet the ML-ready feature matrix; that is built by
-src/data/build_master_table.py after feature engineering is applied.
+src/feature_engineering/build_features.py after feature engineering is applied.
 
 Join logic (all LEFT joins from results as the spine):
   results          <- spine  (one row per driver per race)
@@ -30,7 +30,7 @@ can be derived from the authoritative status label, not from a pre-existing
 flag that may have been set inconsistently in clean_data.py.
 
 Run:
-  python src/data/merge_data.py
+  python src/data_processing/04_merge_data.py
 """
 
 import logging

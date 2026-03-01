@@ -1,11 +1,11 @@
 """
-src/data/clean_data.py
-----------------------
+src/data_processing/02_clean_data.py
+------------------------------------
 Data cleaning module for the F1 Race Intelligence System.
 
 Reads raw CSVs from data/raw/, applies table-specific cleaning logic,
 and writes cleaned CSV files to data/interim/ as the foundation for
-merge_data.py.
+src/data_processing/04_merge_data.py.
 
 Cleaning operations per table:
   circuits     : strip whitespace, normalize nulls, validate lat/lng
@@ -22,8 +22,8 @@ Notes on is_dnf:
   clean_results() sets is_dnf as a quick interim flag based on positionText
   codes (R/D/E/W/F/N). This is intentionally coarse — it covers all
   non-finishers but does not distinguish failure cause.
-  merge_data.py and build_master_table.py recompute is_dnf and add
-  dnf_type ('mechanical' / 'crash' / 'other') from the authoritative
+  src/data_processing/04_merge_data.py and src/feature_engineering/build_features.py 
+  recompute is_dnf and add dnf_type ('mechanical' / 'crash' / 'other') from the authoritative
   status label using constants.py classifiers. The interim flag exists
   only so results_clean.csv is self-contained before the merge step.
   The POSITION_TEXT_DNF_CODES set used here is defined in constants.py
@@ -35,20 +35,20 @@ Output:
   e.g.  data/interim/results_clean.csv
 
 Run:
-  python src/data/clean_data.py
+  python src/data_processing/02_clean_data.py
 """
 
 import re
 import logging
 import warnings
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import yaml
 
-# Add project root to sys.path to allow absolute imports from src
+# Add project root to sys.path for absolute imports from src
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -304,7 +304,10 @@ def clean_results(df: pd.DataFrame) -> pd.DataFrame:
                      grid, grid_pit_lane, position, positionText,
                      positionOrder, points, laps, milliseconds, fastestLap,
                      rank, fastestLapTime_ms, fastestLapSpeed, statusId,
-                     is_dnf, is_podium
+                     is_dnf, is_podium, is_shared_drive
+                     (grid_pit_lane era assignment and is_shared_drive are
+                      finalised in the post-processing pass of run_cleaning(),
+                      after races_clean.csv is available)
 
     Key issues:
       - position: \\N when driver did not finish — correct, not a data error
@@ -649,6 +652,89 @@ def run_cleaning(
         log.info("  Saved -> %s", out_path)
 
         cleaned[table_name] = df_clean
+
+    # ── Post-processing pass: cross-table derivations ──────────────────────────
+    # These flags require data from more than one table and therefore cannot be
+    # computed inside the individual cleaner functions above. They run once both
+    # the required tables are available in memory, then re-save the affected CSV.
+
+    if "results" in cleaned and "races" in cleaned:
+
+        results_df = cleaned["results"].copy()
+        races_df   = cleaned["races"]
+
+        # ── OI-2: grid_pit_lane era assignment ─────────────────────────────────
+        # clean_results() sets grid_pit_lane = 0 for all rows because the race
+        # year is not available at clean time. Now that races_clean.csv is loaded
+        # we can make the correct determination:
+        #   grid IS NULL + year >= 1996 → genuine pit-lane start → flag = 1
+        #   grid IS NULL + year <  1996 → historic data gap       → flag remains 0
+        if "raceId" in races_df.columns and "year" in races_df.columns:
+            race_year_map = races_df.set_index("raceId")["year"]
+            results_df["_year"] = pd.to_numeric(
+                results_df["raceId"].map(race_year_map), errors="coerce"
+            )
+
+            modern_pit_mask = (
+                results_df["grid"].isna()
+                & results_df["grid_pit_lane"].eq(0)
+                & (results_df["_year"] >= 1996)
+            )
+            n_modern = int(modern_pit_mask.sum())
+
+            historic_gap_mask = (
+                results_df["grid"].isna()
+                & (results_df["_year"] < 1996)
+            )
+            n_historic = int(historic_gap_mask.sum())
+
+            if n_modern:
+                results_df.loc[modern_pit_mask, "grid_pit_lane"] = 1
+                log.info(
+                    "  [post-clean] grid_pit_lane: %d post-1995 null-grid rows -> 1 "
+                    "(pit-lane start).",
+                    n_modern,
+                )
+            log.info(
+                "  [post-clean] grid_pit_lane: %d pre-1996 null-grid rows remain 0 "
+                "(historic data gap).",
+                n_historic,
+            )
+            results_df.drop(columns=["_year"], inplace=True)
+
+        # ── OI-6: is_shared_drive flag ─────────────────────────────────────────
+        # Pre-1970 car-sharing: multiple drivers entered under the same car in
+        # stints, producing duplicate raceId x driverId rows in the Kaggle source.
+        # Diagnostics (2026-02-28) confirmed all duplicates are 1950-1964 races.
+        # Flag every row that is part of such a duplicate pair.
+        # Confirmed safe: no modern duplicate raceId x driverId pairs exist.
+        results_df["is_shared_drive"] = (
+            results_df.duplicated(subset=["raceId", "driverId"], keep=False)
+            .astype("int8")
+        )
+        n_shared = int(results_df["is_shared_drive"].sum())
+        if n_shared:
+            log.info(
+                "  [post-clean] is_shared_drive: flagged %d rows as shared-drive "
+                "(pre-1970 car-sharing, %d distinct raceId x driverId pairs).",
+                n_shared,
+                int(results_df.duplicated(subset=["raceId", "driverId"]).sum()),
+            )
+
+        # Save the updated results_clean.csv
+        out_path = interim_dir / "results_clean.csv"
+        results_df.to_csv(out_path, index=False)
+        cleaned["results"] = results_df
+        log.info(
+            "  [post-clean] results_clean.csv re-saved with grid_pit_lane (era) "
+            "and is_shared_drive columns."
+        )
+
+    else:
+        log.warning(
+            "  [post-clean] Skipping grid_pit_lane era assignment and is_shared_drive: "
+            "results or races table not available."
+        )
 
     log.info("=" * 55)
     log.info(

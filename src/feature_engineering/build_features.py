@@ -1,11 +1,11 @@
 """
-src/data/build_master_table.py
-------------------------------
+src/feature_engineering/build_features.py
+------------------------------------------
 Produces the final analysis-ready master race table and loads all
 cleaned tables into a SQLite database for SQL-based analysis.
 
 Reads:
-  data/interim/cleaned_merged_data.csv    (from src/data/merge_data.py)
+  data/interim/cleaned_merged_data.csv    (from src/data_processing/04_merge_data.py)
   data/interim/*_clean.csv               (individual cleaned tables)
   sql/schema.sql                         (table DDL + indexes)
   sql/views.sql                          (analytical views)
@@ -20,23 +20,23 @@ Writes:
                                              - 4 analytical views
 
 Pipeline position:
-  clean_data.py -> merge_data.py -> [THIS FILE] -> feature engineering
+  src/data_processing/02_clean_data.py -> src/data_processing/04_merge_data.py -> [THIS FILE]
 
 Run:
-  python src/data/build_master_table.py
+  python src/feature_engineering/build_features.py
 """
 
 import logging
 import sqlite3
+import sys
 import warnings
 from pathlib import Path
-import sys
 
 import numpy as np
 import pandas as pd
 import yaml
 
-# Add project root to sys.path to allow absolute imports from src
+# Add project root to sys.path for absolute imports from src
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -277,57 +277,63 @@ def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
         np.nan,
     )
 
-    # ── OI-5: pit_data_incomplete flag ─────────────────────────────────────
-    # Some races have >30% of pit stop duration entries as null due to partial
-    # data feed failures in the Kaggle source (e.g. 2023 Australian GP: 70.8%
-    # null, 2021 Saudi GP: 74.5% null). These races are unreliable for pit
-    # stop strategy analysis. Flag them at the driver-race level so models can
-    # filter them out: WHERE pit_data_incomplete = 0.
+    # ── OI-5: pit_data_incomplete flag ─────────────────────────────────────────
+    # Some races have >30% of individual pit stop duration entries as null due
+    # to partial data feed failures in the Kaggle source
+    # (e.g. 2023 Australian GP: 70.8% null, 2021 Saudi GP: 74.5% null).
+    # These races are unreliable for pit stop strategy analysis.
+    # Flag them at the driver-race level so models can filter:
+    #   WHERE pit_data_incomplete = 0
     #
-    # Threshold: 30% null pit durations per race = incomplete feed.
-    # This is computed from total_pit_stops (all stops) and the count of stops
-    # with valid duration. If a driver has no pit stops, flag inherits from race.
-    if "total_pit_stops" in df.columns and "avg_pit_duration_ms" in df.columns:
-        # Derive incomplete races from the cleaned_merged_data already in df
-        # total_pit_stops includes stops with null duration (count of rows joined)
-        # avg_pit_duration_ms is null if ALL stops were null duration
-        # We use the race-level null rate from pit_stops directly
-        # Approach: compute per-race null rate and join back
-        if "total_pit_stops" in df.columns:
-            # Proxy: if avg_pit_duration_ms IS NULL but total_pit_stops > 0 →
-            # all stops in this driver's race had null duration.
-            # For the race-level flag, we need the race-wide rate.
-            # Use a groupby to get per-race fraction of drivers with null avg.
-            stops_present = df["total_pit_stops"].fillna(0) > 0
-            all_null_duration = stops_present & df["avg_pit_duration_ms"].isna()
-
-            race_null_rate = (
-                df[stops_present]
-                .groupby("raceId")
-                .apply(lambda g: g["avg_pit_duration_ms"].isna().mean())
-                .rename("race_pit_null_rate")
-                .reset_index()
+    # FIX (2026-03-01): The previous proxy (fraction of drivers with fully-null
+    # avg_pit_duration_ms) was too conservative — for races where 40-58% of
+    # individual stops are null, many drivers still had >= 1 valid stop, so
+    # avg_pit_duration_ms was not null and those races were missed.
+    # Correct approach: load pit_stops_clean.csv and compute null rate at
+    # individual stop level per race.
+    pit_incomplete_race_ids: set = set()
+    pit_stops_path = INTERIM_DIR / "pit_stops_clean.csv"
+    if pit_stops_path.exists():
+        pit_raw = pd.read_csv(pit_stops_path, low_memory=False)
+        if "pit_duration_ms" in pit_raw.columns and "raceId" in pit_raw.columns:
+            pit_race_size = pit_raw.groupby("raceId")["pit_duration_ms"].size().rename("total_stops")
+            pit_race_null = pit_raw.groupby("raceId")["pit_duration_ms"].apply(
+                lambda s: int(s.isna().sum())
+            ).rename("null_stops")
+            pit_race_stats = pd.concat([pit_race_size, pit_race_null], axis=1)
+            pit_race_stats["null_rate"] = (
+                pit_race_stats["null_stops"] / pit_race_stats["total_stops"]
             )
-            df = df.merge(race_null_rate, on="raceId", how="left")
-            df["pit_data_incomplete"] = (
-                df["race_pit_null_rate"].fillna(0) > 0.30
-            ).astype("int8")
-            df.drop(columns=["race_pit_null_rate"], inplace=True)
-
-            n_incomplete = int(df["pit_data_incomplete"].eq(1).sum())
-            n_races_incomplete = int(
-                df[df["pit_data_incomplete"] == 1]["raceId"].nunique()
+            pit_incomplete_race_ids = set(
+                pit_race_stats[pit_race_stats["null_rate"] > 0.30].index
             )
-            if n_incomplete:
-                log.info(
-                    "  pit_data_incomplete: flagged %d driver-race rows across %d races "
-                    "(>30%% null pit duration). Exclude from pit stop strategy models.",
-                    n_incomplete, n_races_incomplete,
-                )
+            log.info(
+                "  pit_data_incomplete: %d races have >30%% null pit duration "
+                "(stop-level calculation from pit_stops_clean.csv).",
+                len(pit_incomplete_race_ids),
+            )
         else:
-            df["pit_data_incomplete"] = 0
+            log.warning(
+                "  pit_data_incomplete: pit_stops_clean.csv missing required columns. "
+                "Flag will be 0 for all rows."
+            )
     else:
-        df["pit_data_incomplete"] = 0
+        log.warning(
+            "  pit_data_incomplete: pit_stops_clean.csv not found at %s. "
+            "Flag will be 0 for all rows.", pit_stops_path,
+        )
+
+    df["pit_data_incomplete"] = (
+        df["raceId"].isin(pit_incomplete_race_ids).astype("int8")
+    )
+    n_incomplete_rows  = int(df["pit_data_incomplete"].eq(1).sum())
+    n_incomplete_races = int(df[df["pit_data_incomplete"] == 1]["raceId"].nunique())
+    if n_incomplete_rows:
+        log.info(
+            "  pit_data_incomplete: flagged %d driver-race rows across %d races. "
+            "Exclude from pit stop strategy models (WHERE pit_data_incomplete = 0).",
+            n_incomplete_rows, n_incomplete_races,
+        )
 
     # is_points_finish: any points scored in this race
     df["is_points_finish"] = (

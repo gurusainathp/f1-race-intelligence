@@ -1,6 +1,6 @@
 """
-src/data/run_diagnostics.py
----------------------------
+src/validation/run_diagnostics.py
+----------------------------------
 Runs all data quality diagnostic SQL queries against the SQLite database
 and produces a human-readable markdown report at:
     reports/diagnostics_report.md
@@ -15,10 +15,10 @@ Important note on ordering:
   races.year + races.round (never ORDER BY raceId / driverId).
 
 Run from the project root:
-  python src/data/run_diagnostics.py
+  python src/validation/run_diagnostics.py
 
 Requires:
-  data/processed/f1_database.db  (produced by build_master_table.py)
+  data/processed/f1_database.db  (produced by src/feature_engineering/build_features.py)
 """
 
 import logging

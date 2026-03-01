@@ -1,6 +1,6 @@
 """
-src/data/patch_data.py
-----------------------
+src/data_processing/03_patch_data.py
+------------------------------------
 Applies small, documented corrections to cleaned interim CSV files before
 they enter the merge pipeline.
 
@@ -21,13 +21,13 @@ patch_data.py  : Applies targeted corrections to specific rows identified by
                    - Idempotent (safe to run multiple times)
 
 Run order:
-  1. clean_data.py     → data/interim/*_clean.csv
-  2. patch_data.py     → overwrites affected rows in data/interim/*_clean.csv
-  3. merge_data.py     → data/interim/cleaned_merged_data.csv
-  4. build_master_table.py → data/processed/
+  1. src/data_processing/02_clean_data.py     → data/interim/*_clean.csv
+  2. src/data_processing/03_patch_data.py     → overwrites affected rows in data/interim/*_clean.csv
+  3. src/data_processing/04_merge_data.py     → data/interim/cleaned_merged_data.csv
+  4. src/feature_engineering/build_features.py → data/processed/
 
 Run:
-  python src/data/patch_data.py
+  python src/data_processing/03_patch_data.py
 
 Output:
   Modified data/interim/*_clean.csv files (in-place overwrite, git-trackable)
@@ -36,12 +36,18 @@ Output:
 
 import logging
 import warnings
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import yaml
+
+# Add project root to sys.path for absolute imports from src
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 warnings.filterwarnings("ignore")
 

@@ -1,6 +1,6 @@
 """
-src/data/load_data.py
----------------------
+src/data_processing/01_load_data.py
+-----------------------------------
 Data ingestion module for the F1 Race Intelligence System.
 
 Downloads the Formula 1 dataset from Kaggle via kagglehub and copies
@@ -12,10 +12,10 @@ Requires:
       ~/.kaggle/kaggle.json  OR  KAGGLE_USERNAME / KAGGLE_KEY env vars
 
 Run from the project root:
-  python src/data/load_data.py
+  python src/data_processing/01_load_data.py
 
 Or as a module:
-  python -m src.data.load_data
+  python -m src.data_processing.01_load_data
 """
 
 import logging
