@@ -119,9 +119,9 @@ MASTER_TABLE_COLS = [
     # Constructor
     "constructorId", "constructorRef", "constructor_name", "constructor_nationality",
     # Race result
-    "grid", "position", "positionText", "positionOrder",
+    "grid", "grid_pit_lane", "position", "positionText", "positionOrder",
     "points", "laps", "milliseconds", "statusId", "status",
-    "is_dnf", "is_podium",
+    "is_dnf", "is_podium", "is_shared_drive",
     "fastestLap", "rank", "fastestLapTime_ms", "fastestLapSpeed",
     # Qualifying
     "quali_position", "q1_ms", "q2_ms", "q3_ms",
@@ -130,6 +130,7 @@ MASTER_TABLE_COLS = [
     # Pit stops (aggregated)
     "total_pit_stops", "total_pit_time_ms",
     "avg_pit_duration_ms", "min_pit_duration_ms",
+    "pit_data_incomplete",   # OI-5: 1 if >30% of pit stop durations are null for this race
     # Lap times (aggregated)
     "laps_completed", "avg_lap_time_ms", "median_lap_time_ms",
     "std_lap_time_ms", "fastest_lap_ms", "lap_time_consistency",
@@ -270,6 +271,58 @@ def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
         np.nan,
     )
 
+    # ── OI-5: pit_data_incomplete flag ─────────────────────────────────────
+    # Some races have >30% of pit stop duration entries as null due to partial
+    # data feed failures in the Kaggle source (e.g. 2023 Australian GP: 70.8%
+    # null, 2021 Saudi GP: 74.5% null). These races are unreliable for pit
+    # stop strategy analysis. Flag them at the driver-race level so models can
+    # filter them out: WHERE pit_data_incomplete = 0.
+    #
+    # Threshold: 30% null pit durations per race = incomplete feed.
+    # This is computed from total_pit_stops (all stops) and the count of stops
+    # with valid duration. If a driver has no pit stops, flag inherits from race.
+    if "total_pit_stops" in df.columns and "avg_pit_duration_ms" in df.columns:
+        # Derive incomplete races from the cleaned_merged_data already in df
+        # total_pit_stops includes stops with null duration (count of rows joined)
+        # avg_pit_duration_ms is null if ALL stops were null duration
+        # We use the race-level null rate from pit_stops directly
+        # Approach: compute per-race null rate and join back
+        if "total_pit_stops" in df.columns:
+            # Proxy: if avg_pit_duration_ms IS NULL but total_pit_stops > 0 →
+            # all stops in this driver's race had null duration.
+            # For the race-level flag, we need the race-wide rate.
+            # Use a groupby to get per-race fraction of drivers with null avg.
+            stops_present = df["total_pit_stops"].fillna(0) > 0
+            all_null_duration = stops_present & df["avg_pit_duration_ms"].isna()
+
+            race_null_rate = (
+                df[stops_present]
+                .groupby("raceId")
+                .apply(lambda g: g["avg_pit_duration_ms"].isna().mean())
+                .rename("race_pit_null_rate")
+                .reset_index()
+            )
+            df = df.merge(race_null_rate, on="raceId", how="left")
+            df["pit_data_incomplete"] = (
+                df["race_pit_null_rate"].fillna(0) > 0.30
+            ).astype("int8")
+            df.drop(columns=["race_pit_null_rate"], inplace=True)
+
+            n_incomplete = int(df["pit_data_incomplete"].eq(1).sum())
+            n_races_incomplete = int(
+                df[df["pit_data_incomplete"] == 1]["raceId"].nunique()
+            )
+            if n_incomplete:
+                log.info(
+                    "  pit_data_incomplete: flagged %d driver-race rows across %d races "
+                    "(>30%% null pit duration). Exclude from pit stop strategy models.",
+                    n_incomplete, n_races_incomplete,
+                )
+        else:
+            df["pit_data_incomplete"] = 0
+    else:
+        df["pit_data_incomplete"] = 0
+
     # is_points_finish: any points scored in this race
     df["is_points_finish"] = (
         pd.to_numeric(df["points"], errors="coerce").fillna(0) > 0
@@ -315,9 +368,10 @@ def build_master_table(merged_path: Path = MERGED_FILE) -> pd.DataFrame:
 
     int_cols = [
         "raceId", "year", "round", "circuitId", "driverId", "constructorId",
-        "grid", "position", "positionOrder", "laps", "statusId",
+        "grid", "grid_pit_lane", "position", "positionOrder", "laps", "statusId",
         "fastestLap", "rank", "quali_position", "total_pit_stops", "laps_completed",
         "is_dnf", "is_podium", "is_winner", "is_points_finish",
+        "is_shared_drive", "pit_data_incomplete",
     ]
     for col in int_cols:
         if col in df.columns:

@@ -378,6 +378,37 @@ def clean_results(df: pd.DataFrame) -> pd.DataFrame:
     df = null_out_outliers(df, "fastestLapTime_ms", LAP_TIME_MIN_MS, LAP_TIME_MAX_MS)
     df.drop(columns=["fastestLapTime"], inplace=True)
 
+    # ── Position backfill for classified finishers with null position ──────────
+    #
+    # Diagnostic finding (2026-02-28, query A2):
+    #   2 rows have position IS NULL but is_dnf = 0 — both are lapped finishers
+    #   (+1 Lap, +2 Laps) whose position column is \N in the raw Kaggle data.
+    #   positionText and positionOrder are correct and verified against F1
+    #   official records. Backfilling from positionOrder is safe and auditable.
+    #
+    # Condition: position IS NULL AND positionText NOT IN DNF text codes
+    #   (i.e. positionText is a numeric string or a lapped-finisher code,
+    #    meaning the race classification system awarded a finishing position)
+    backfill_mask = (
+        df["position"].isna()
+        & ~df["positionText"].isin(POSITION_TEXT_DNF_CODES)
+        & df["positionOrder"].notna()
+    )
+    n_backfill = int(backfill_mask.sum())
+    if n_backfill > 0:
+        log.info(
+            "  Backfilling position from positionOrder for %d classified finishers "
+            "with null position (source data gap, positionText/positionOrder verified).",
+            n_backfill,
+        )
+        # Log each affected row at debug level for audit trail
+        for _, row in df.loc[backfill_mask, ["positionText", "positionOrder"]].iterrows():
+            log.debug(
+                "    positionText=%s  positionOrder=%s → position set to %s",
+                row["positionText"], row["positionOrder"], row["positionOrder"],
+            )
+        df.loc[backfill_mask, "position"] = df.loc[backfill_mask, "positionOrder"]
+
     # ── is_dnf interim flag ────────────────────────────────────────────────
     # Uses POSITION_TEXT_DNF_CODES from constants.py — the same module that
     # defines the status-label classifiers used downstream. Any change to

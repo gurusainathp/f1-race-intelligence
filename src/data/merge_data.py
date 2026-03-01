@@ -227,6 +227,23 @@ def build_merged_dataset(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
     df = tables["results"].copy()
     log.info("  Spine (results):        %d rows", len(df))
 
+    # ── OI-6: is_shared_drive flag ─────────────────────────────────────────
+    # 1950s–60s car-sharing: multiple drivers shared one car in stints.
+    # These appear as duplicate raceId × driverId rows with the same
+    # constructorId but different laps values. Flag all duplicate pairs so
+    # downstream models can exclude or handle them explicitly.
+    # The full era guard (year < 1970) is applied after the races join below;
+    # for now flag all duplicates — the validate_data.py car-sharing classifier
+    # confirms these only exist in pre-1970 races.
+    dupe_mask = df.duplicated(subset=["raceId", "driverId"], keep=False)
+    df["is_shared_drive"] = dupe_mask.astype("int8")
+    n_shared = int(dupe_mask.sum())
+    if n_shared:
+        log.info(
+            "  is_shared_drive: flagged %d rows (%d pairs) as car-sharing duplicates.",
+            n_shared, n_shared - df.duplicated(subset=["raceId", "driverId"]).sum(),
+        )
+
     # ── Step 2: + races ─────────────────────────────────────────────────────
     races_cols = ["raceId", "year", "round", "circuitId", "name", "date",
                   "fp1_date", "fp2_date", "fp3_date", "quali_date", "sprint_date"]
@@ -236,6 +253,30 @@ def build_merged_dataset(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
         on="raceId", how="left", validate="many_to_one",
     )
     log.info("  After + races:          %d rows", len(df))
+
+    # ── OI-2: Assign grid_pit_lane now that race year is available ─────────
+    # clean_data.py sets grid_pit_lane = 0 for all rows (year not available
+    # at clean time). Here we update it: post-1995 null-grid rows are genuine
+    # pit-lane starts; pre-1996 null-grid rows are missing historic data.
+    if "grid_pit_lane" in df.columns and "year" in df.columns:
+        modern_pit_mask = (
+            df["grid"].isna()
+            & (pd.to_numeric(df["year"], errors="coerce") >= 1996)
+        )
+        n_pit = int(modern_pit_mask.sum())
+        df.loc[modern_pit_mask, "grid_pit_lane"] = 1
+        log.info(
+            "  grid_pit_lane: set %d post-1995 null-grid rows to 1 (pit-lane start).",
+            n_pit,
+        )
+        historic_null = int(
+            (df["grid"].isna()
+            & (pd.to_numeric(df["year"], errors="coerce") < 1996)).sum()
+        )
+        log.info(
+            "  grid_pit_lane: %d pre-1996 null-grid rows remain 0 (historic data gap).",
+            historic_null,
+        )
 
     # ── Step 3: + circuits ──────────────────────────────────────────────────
     circuit_cols = ["circuitId", "circuitRef", "name", "location", "country", "lat", "lng", "alt"]
@@ -344,6 +385,40 @@ def enrich_merged(df: pd.DataFrame) -> pd.DataFrame:
         df["is_dnf"]   = compute_is_dnf_series(df["status"])
         df["dnf_type"] = compute_dnf_type_series(df["status"])
 
+        # ── OI-3: positionText classification override ────────────────────
+        # The race stewards' classification is authoritative over the status
+        # label. If positionText is numeric (driver was officially classified)
+        # then is_dnf must be 0, regardless of what the status label says.
+        #
+        # Real cases this corrects:
+        #   "Out of fuel" — 79 rows have a finishing position.  Some drivers
+        #   ran dry but were classified because the next car on track was a lap
+        #   down (e.g. Frentzen P3 at 1999 Brazilian GP despite running out of
+        #   fuel — the 4th-placed car was a lap down and finished the race
+        #   before catching him).  The 90% rule (driver must complete 90% of
+        #   winner's laps) also allows classification of drivers who stopped
+        #   late.  In both cases positionText is numeric → driver is a
+        #   classified finisher, not a DNF.
+        #
+        # Rule: positionText is numeric → classified → is_dnf = 0
+        #       positionText in {R, D, E, W, F, N} → not classified → honour
+        #       the status-label flag
+        if "positionText" in df.columns:
+            numeric_position_text = pd.to_numeric(
+                df["positionText"], errors="coerce"
+            ).notna()
+            overridden = int(
+                ((df["is_dnf"] == 1) & numeric_position_text).sum()
+            )
+            if overridden:
+                log.info(
+                    "  positionText override: correcting %d rows where status label "
+                    "implies DNF but driver was officially classified (numeric positionText).",
+                    overridden,
+                )
+                df.loc[numeric_position_text, "is_dnf"]   = 0
+                df.loc[numeric_position_text, "dnf_type"] = None
+
         n_dnf = int(df["is_dnf"].sum())
         log.info(
             "  is_dnf: %d DNFs / %d total (%.1f%%)",
@@ -409,9 +484,9 @@ _CONSTRUCTOR_COLS = [
     "constructorId", "constructorRef", "constructor_name", "constructor_nationality",
 ]
 _RESULT_COLS = [
-    "resultId", "grid", "position", "positionText", "positionOrder",
+    "resultId", "grid", "grid_pit_lane", "position", "positionText", "positionOrder",
     "points", "laps", "milliseconds", "statusId", "status",
-    "is_dnf", "dnf_type", "is_podium",
+    "is_dnf", "dnf_type", "is_podium", "is_shared_drive",
     "fastestLap", "rank", "fastestLapTime_ms", "fastestLapSpeed",
 ]
 _QUALI_COLS = [

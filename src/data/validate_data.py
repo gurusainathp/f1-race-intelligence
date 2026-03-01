@@ -60,6 +60,13 @@ EXPECTED_SCHEMA: dict[str, set[str]] = {
     "lap_times":    {"raceId", "driverId", "lap", "position", "lap_time_ms"},
 }
 
+# Columns expected in the master_race_table (produced by build_master_table.py)
+# These are checked separately in section_schema_drift if master_race_table is loaded.
+EXPECTED_MASTER_COLS: set[str] = {
+    "is_shared_drive", "pit_data_incomplete", "grid_pit_lane",
+    "is_dnf", "dnf_type", "is_podium", "is_winner", "is_points_finish",
+}
+
 # ── Null context: columns whose high null rate is structurally expected ─────────
 # Format: col_name → (reason, min_null_pct_to_excuse)
 # These columns will be marked "ℹ️ Justified" rather than "❌ High" in the report.
@@ -87,8 +94,20 @@ JUSTIFIED_NULLS: dict[str, str] = {
         "0 = not a pit-lane start or pre-1996 data gap. Always filled — never null"
     ),
     # qualifying — session format dependent on era
-    "q2_ms": "Q2 only exists in 3-part qualifying introduced in 2006",
-    "q3_ms": "Q3 only exists for top-10 qualifiers post-2006 (structural ~65% null)",
+    # Pre-1996: single aggregate qualifying session (q1_ms captures the time)
+    # 1996-2002: two 1-hour sessions (q1_ms = session 1, q2_ms = session 2)
+    # 2003-2005: single-lap shootout format (q1_ms used, q2_ms/q3_ms null)
+    # 2006+:  three-part knockout format (Q1/Q2/Q3 as currently recorded)
+    # Nulls in q2_ms and q3_ms for pre-2006 races are therefore structurally
+    # expected. Post-2006 nulls are data gaps (DQ, DNS, 107% failure etc.).
+    "q2_ms": (
+        "Q2 null expected for single-session formats (pre-1996, 2003-2005). "
+        "Post-2006: driver eliminated in Q1 or did not set a time (DNS/DQ/107%)"
+    ),
+    "q3_ms": (
+        "Q3 only exists for top-10 qualifiers in 3-part format introduced 2006. "
+        "Structural ~65% null for all post-2006 races; 100% null for all pre-2006"
+    ),
 }
 
 # Columns that are high-null but NEED investigation (not automatically excused)
@@ -105,9 +124,12 @@ INVESTIGATE_NULLS: dict[str, str] = {
         "Modern: genuine pit-lane starts. Do NOT use grid alone for pre-1996 analysis"
     ),
     "q1_ms": (
-        "1.5% null in qualifying — spans 1994-2024 including modern seasons. "
-        "Known causes: entire races missing from Kaggle source (e.g. 1995 Australian GP "
-        "— full grid null), 107% rule failures, injury/DNS entries. Not fixable in pipeline"
+        "1.5% null in qualifying — multiple causes confirmed (2026-02-28 investigation): "
+        "(1) entire races missing from Kaggle source (e.g. 1995 Australian GP — full grid null); "
+        "(2) 107% rule failures (driver set no time); "
+        "(3) injury/DNS before Q1 began; "
+        "(4) modern era (2018-2024): disqualification, crash before setting a time, "
+        "mechanical failure before Q1. Not fixable in pipeline — treat as data gap"
     ),
     "best_quali_ms": (
         "1.5% null in qualifying — mirrors q1_ms nulls exactly (derived as min of q1/q2/q3)"

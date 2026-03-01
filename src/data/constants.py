@@ -110,6 +110,12 @@ DNF_KEYWORDS: list[str] = [
     "safety concerns",
     "refuelling",        # pit-lane equipment failure → retirement
     "fuel rig",
+    # ── Start-line and car equipment retirements ──────────────────────────────
+    # All confirmed positionText = R from resultId investigation (2026-02-28)
+    "stalled",           # car stall at start (Häkkinen 2001, Rathmann 1950)
+    "driver seat",       # broken seat fixing (Glock 2008)
+    "seat",              # seat/car ergonomic failure (Pérez 2017)
+    "not restarted",     # race red-flagged, driver had no spare car (de la Rosa 2000)
     # ── Administrative DNF ────────────────────────────────────────────────────
     "disqualified", "did not", "excluded",
     # ── Debris / environmental ────────────────────────────────────────────────
@@ -169,6 +175,18 @@ MECHANICAL_KEYWORDS: list[str] = [
     "safety belt",     # harness failure
     "refuelling",      # pit equipment failure
     "fuel rig",
+    # ── Driver equipment / car ergonomics ─────────────────────────────────────
+    # Confirmed via resultId investigation (2026-02-28):
+    #   "Driver Seat" — Glock 2008 Japan: broken seat fixing → handling issues → retired (R)
+    #   "Seat"        — Pérez 2017 Azerbaijan: front wing collision damage, rejoined,
+    #                   then seat/car issue forced final retirement (R)
+    "driver seat",     # catches "Driver Seat" (case-insensitive)
+    "seat",            # catches "Seat" — car ergonomic failure
+    # ── Start-line retirements ────────────────────────────────────────────────
+    # Confirmed via resultId investigation (2026-02-28):
+    #   "Stalled" — Häkkinen 2001 Brazil: steering wheel not properly attached
+    #             — Dick Rathmann 1950 Indy: genuine stall at start (R)
+    "stalled",
 ]
 
 # ---------------------------------------------------------------------------

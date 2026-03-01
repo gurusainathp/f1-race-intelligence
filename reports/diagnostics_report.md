@@ -1,6 +1,6 @@
 # F1 Data Quality — Diagnostics Report
 
-> **Generated:** 2026-02-28 00:13:57  
+> **Generated:** 2026-03-01 13:00:56  
 > **Database:** `data\processed\f1_database.db`  
 > **Purpose:** Classify each scorecard failure as DATA issue or SCRIPT issue
 
@@ -21,19 +21,20 @@ After reviewing, classify each finding as:
 
 ### A1. Position null vs is_dnf cross-tab
 
-**Question:** Is the 41% null rate in results.position legitimate?
+**Question:** After the position backfill fix, are there any remaining classified finishers with null position?
 
 **Interpretation guide:**  
-**Data fine / script bug** if 'null position + NOT DNF' count is 0 or tiny.
-**Data problem** if 'null position + NOT DNF' or 'has position + DNF' counts are large.
+**Expected after fix:** 'null position + NOT DNF' = 0 rows.
+clean_data.py now backfills position from positionOrder for classified
+finishers (positionText not in R/D/E/W/F/N). If this still shows > 0,
+re-run clean_data.py and rebuild the database.
 
-**Results:** 3 rows
+**Results:** 2 rows
 
 | case_type | row_count |
 | --- | --- |
-| has position + finished (correct) | 15,806 |
+| has position + finished (correct) | 15,808 |
 | null position + DNF (correct) | 10,951 |
-| null position + NOT DNF (investigate) | 2 |
 
 ---
 
@@ -44,12 +45,9 @@ After reviewing, classify each finding as:
 **Interpretation guide:**  
 'Not classified' is the expected answer — drivers who completed laps but weren't awarded a finishing position. If other statuses appear here, those are missing from the DNF classifier in constants.py.
 
-**Results:** 2 rows
+**Results:** 0 rows
 
-| status | count |
-| --- | --- |
-| +2 Laps | 1 |
-| +1 Lap | 1 |
+_No rows returned._
 
 ---
 
@@ -65,7 +63,7 @@ Large difference → genuine data integrity issue.
 
 | position_null_count | dnf_flag_count | difference |
 | --- | --- | --- |
-| 10,953 | 10,951 | 2 |
+| 10,951 | 10,951 | 0 |
 
 ---
 
@@ -621,34 +619,34 @@ race_status = 'Finished' with null q1 → genuine data gap.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1,994 | 3 | San Marino Grand Prix | 259 | 22 | Rubens Barrichello | 28 | — | — | — | Injury | — | 0 |
 | 1,995 | 16 | Japanese Grand Prix | 255 | 87 | Mark Blundell | 24 | — | — | — | +1 Lap | 23 | 52 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 71 | Damon Hill | 1 | — | — | — | Finished | 1 | 81 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 14 | David Coulthard | 2 | — | — | — | Accident | 2 | 19 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 30 | Michael Schumacher | 3 | — | — | — | Collision | 3 | 25 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 77 | Gerhard Berger | 4 | — | — | — | Engine | 4 | 34 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 55 | Jean Alesi | 5 | — | — | — | Collision | 5 | 23 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 49 | Heinz-Harald Frentzen | 6 | — | — | — | Gearbox | 6 | 39 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 22 | Rubens Barrichello | 7 | — | — | — | Spun off | 7 | 20 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 65 | Johnny Herbert | 8 | — | — | — | Transmission | 8 | 69 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 56 | Eddie Irvine | 9 | — | — | — | Engine | 9 | 62 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 87 | Mark Blundell | 10 | — | — | — | +2 Laps | 10 | 79 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 84 | Martin Brundle | 11 | — | — | — | Spun off | 11 | 29 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 44 | Olivier Panis | 12 | — | — | — | +2 Laps | 12 | 79 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 81 | Gianni Morbidelli | 13 | — | — | — | +2 Laps | 13 | 79 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 63 | Mika Salo | 14 | — | — | — | +3 Laps | 14 | 78 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 69 | Luca Badoer | 15 | — | — | — | Electrical | 15 | 0 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 79 | Ukyo Katayama | 16 | — | — | — | Engine | 16 | 70 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 83 | Pedro Lamy | 17 | — | — | — | +3 Laps | 17 | 78 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 91 | Karl Wendlinger | 18 | — | — | — | Physical | 18 | 8 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 89 | Taki Inoue | 19 | — | — | — | Spun off | 19 | 15 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 90 | Roberto Moreno | 20 | — | — | — | Spun off | 20 | 21 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 64 | Pedro Diniz | 21 | — | — | — | +4 Laps | 21 | 77 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 85 | Andrea Montermini | 22 | — | — | — | Gearbox | 22 | 2 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 92 | Bertrand Gachot | 23 | — | — | — | +5 Laps | 23 | 76 |
-| 1,995 | 17 | Australian Grand Prix | 256 | 57 | Mika Häkkinen | 24 | — | — | — | Injured | 24 | 0 |
+| 1,995 | 17 | Australian Grand Prix | 256 | 55 | Jean Alesi | 5 | — | 76,305 | — | Collision | 5 | 23 |
 | 1,996 | 2 | Brazilian Grand Prix | 225 | 58 | Tarso Marques | 21 | — | — | — | Spun off | 21 | 0 |
 | 1,996 | 2 | Brazilian Grand Prix | 225 | 64 | Pedro Diniz | 22 | — | — | — | +2 Laps | 22 | 69 |
 | 1,996 | 5 | San Marino Grand Prix | 228 | 85 | Andrea Montermini | 22 | — | — | — | 107% Rule | 22 | 0 |
 | 1,997 | 9 | British Grand Prix | 215 | 82 | Norberto Fontana | 22 | — | — | — | +1 Lap | 14 | 58 |
+| 1,998 | 9 | British Grand Prix | 199 | 23 | Ralf Schumacher | 21 | — | — | — | +1 Lap | 21 | 59 |
+| 1,998 | 9 | British Grand Prix | 199 | 44 | Olivier Panis | 22 | — | — | — | Spun off | 22 | 40 |
+| 1,999 | 2 | Brazilian Grand Prix | 176 | 35 | Jacques Villeneuve | 21 | — | — | — | Hydraulics | 21 | 49 |
+| 2,003 | 1 | Australian Grand Prix | 108 | 51 | Justin Wilson | 19 | — | — | — | Radiator | 19 | 16 |
+| 2,003 | 1 | Australian Grand Prix | 108 | 50 | Jos Verstappen | 20 | — | — | — | +1 Lap | 20 | 57 |
+| 2,003 | 4 | San Marino Grand Prix | 111 | 50 | Jos Verstappen | 20 | — | — | — | Electrical | 20 | 38 |
+| 2,003 | 5 | Spanish Grand Prix | 112 | 8 | Kimi Räikkönen | 20 | — | — | — | Collision | 20 | 0 |
+| 2,003 | 6 | Austrian Grand Prix | 113 | 50 | Jos Verstappen | 20 | — | — | — | Clutch | 20 | 0 |
+| 2,003 | 7 | Monaco Grand Prix | 114 | 18 | Jenson Button | 20 | — | — | — | Injured | 20 | 0 |
+| 2,003 | 8 | Canadian Grand Prix | 115 | 8 | Kimi Räikkönen | 20 | — | — | — | Finished | 20 | 70 |
+| 2,003 | 9 | European Grand Prix | 116 | 2 | Nick Heidfeld | 20 | — | — | — | +1 Lap | 20 | 59 |
+| 2,003 | 11 | British Grand Prix | 118 | 18 | Jenson Button | 20 | — | — | — | Finished | 20 | 60 |
+| 2,003 | 16 | Japanese Grand Prix | 123 | 23 | Ralf Schumacher | 19 | — | — | — | +1 Lap | 19 | 52 |
+| 2,003 | 16 | Japanese Grand Prix | 123 | 15 | Jarno Trulli | 20 | — | — | — | Finished | 20 | 53 |
+| 2,004 | 1 | Australian Grand Prix | 90 | 44 | Olivier Panis | 18 | — | — | — | +2 Laps | 18 | 56 |
+| 2,004 | 1 | Australian Grand Prix | 90 | 32 | Christian Klien | 19 | — | — | — | +2 Laps | 19 | 56 |
+| 2,004 | 1 | Australian Grand Prix | 90 | 46 | Gianmaria Bruni | 20 | — | — | — | Not classified | 20 | 43 |
+| 2,004 | 2 | Malaysian Grand Prix | 91 | 4 | Fernando Alonso | 19 | — | — | — | Finished | 19 | 56 |
+| 2,004 | 2 | Malaysian Grand Prix | 91 | 11 | Takuma Sato | 20 | — | — | — | +4 Laps | 20 | 52 |
+| 2,004 | 3 | Bahrain Grand Prix | 92 | 8 | Kimi Räikkönen | 20 | — | — | — | Engine | 19 | 7 |
+| 2,004 | 4 | San Marino Grand Prix | 93 | 21 | Giancarlo Fisichella | 19 | — | — | — | +1 Lap | 18 | 61 |
+| 2,004 | 4 | San Marino Grand Prix | 93 | 8 | Kimi Räikkönen | 20 | — | — | — | +1 Lap | 20 | 61 |
+| 2,004 | 7 | European Grand Prix | 96 | 14 | David Coulthard | 18 | — | — | — | Engine | 18 | 25 |
 
 ---
 
@@ -665,7 +663,7 @@ Post-2006 entries present → data gaps in modern qualifying records.
 | year | null_q1_count |
 | --- | --- |
 | 1,994 | 1 |
-| 1,995 | 25 |
+| 1,995 | 2 |
 | 1,996 | 3 |
 | 1,997 | 1 |
 | 1,998 | 2 |
@@ -758,10 +756,144 @@ null_stops << total_stops → individual stops missing, random gaps.
 
 ---
 
+## BLOCK H — `grid_pit_lane` flag verification (OI-2)
+
+### H1. grid_pit_lane: modern vs historic null-grid split
+
+**Question:** Does grid_pit_lane correctly separate post-1995 pit-lane starts from pre-1996 data gaps?
+
+**Interpretation guide:**  
+Expected: grid_pit_lane = 1 only for year >= 1996 rows with null grid.
+If grid_pit_lane = 1 appears in pre-1996 rows → merge_data.py year-guard failed.
+If grid_pit_lane = 0 for all post-1995 null-grid rows → merge step not run yet.
+
+**Results:** 2 rows
+
+| era | grid_pit_lane | row_count |
+| --- | --- | --- |
+| historic (<1996) | 0 | 1,538 |
+| modern (>=1996) | 0 | 100 |
+
+---
+
+### H2. grid_pit_lane = 1 rows that scored points
+
+**Question:** Are any pit-lane-start rows scoring points with no grid — or are all of them historic data gaps?
+
+**Interpretation guide:**  
+Modern pit-lane starters (grid_pit_lane = 1) can score points — that is expected.
+Pre-1996 rows with points AND grid IS NULL AND grid_pit_lane = 0 → historic data gap confirmed.
+Pre-1996 rows with points AND grid_pit_lane = 1 → era-guard bug in merge_data.py.
+
+**Results:** 7 rows
+
+| year | grid_pit_lane | null_grid_rows_with_points | total_points |
+| --- | --- | --- | --- |
+| 2,015 | 0 | 1 | 1 |
+| 2,019 | 0 | 4 | 13 |
+| 2,020 | 0 | 1 | 1 |
+| 2,021 | 0 | 2 | 14 |
+| 2,022 | 0 | 2 | 3 |
+| 2,023 | 0 | 3 | 18 |
+| 2,024 | 0 | 1 | 2 |
+
+---
+
+## BLOCK I — New flag verification (OI-3, OI-5, OI-6, OI-7)
+
+### I1. Out-of-fuel is_dnf override: classified finishers correctly marked is_dnf = 0
+
+**Question:** Are drivers officially classified (numeric positionText) no longer flagged as DNF?
+
+**Interpretation guide:**  
+Expected after fix: 0 rows where status = 'Out of fuel' AND
+positionText is numeric AND is_dnf = 1.
+If rows remain → positionText override in merge_data.py did not run.
+
+**Results:** 18 rows
+
+| status | positionText | is_dnf | points | row_count |
+| --- | --- | --- | --- | --- |
+| Out of fuel | R | 1 | 0 | 21 |
+| Out of fuel | 10 | 0 | 0 | 10 |
+| Out of fuel | 7 | 0 | 0 | 10 |
+| Out of fuel | 6 | 0 | 1 | 8 |
+| Out of fuel | 8 | 0 | 0 | 8 |
+| Out of fuel | 9 | 0 | 0 | 8 |
+| Out of fuel | 5 | 0 | 2 | 7 |
+| Out of fuel | 4 | 0 | 3 | 6 |
+| Out of fuel | 11 | 0 | 0 | 5 |
+| Out of fuel | 3 | 0 | 4 | 3 |
+| Out of fuel | 12 | 0 | 0 | 2 |
+| Out of fuel | 13 | 0 | 0 | 2 |
+| Out of fuel | 15 | 0 | 0 | 2 |
+| Out of fuel | 16 | 0 | 0 | 2 |
+| Out of fuel | 19 | 0 | 0 | 2 |
+| Out of fuel | 2 | 0 | 6 | 2 |
+| Out of fuel | 14 | 0 | 0 | 1 |
+| Out of fuel | 17 | 0 | 0 | 1 |
+
+---
+
+### I2. is_shared_drive: pre-1970 car-sharing rows flagged
+
+**Question:** Are all duplicate raceId×driverId rows in the 1950s–60s correctly flagged?
+
+**Interpretation guide:**  
+Expected: all rows with is_shared_drive = 1 have race year < 1970.
+If is_shared_drive = 1 appears in modern years → flag logic too broad.
+
+> ⚠️ **Query failed:** `no such column: r.is_shared_drive`  
+> Check that the database schema matches expectations.
+
+---
+
+### I3. pit_data_incomplete: races with >30% null pit duration flagged
+
+**Question:** Which races are flagged as having incomplete pit stop data?
+
+**Interpretation guide:**  
+Expected: 2023 Australian GP (70.8% null), 2021 Saudi GP (74.5%),
+2016 Brazilian GP (58.1%) among the flagged races.
+Column only present in master_race_table, not raw results table.
+
+**Results:** 3 rows
+
+| year | round | race_name | pit_data_incomplete | drivers |
+| --- | --- | --- | --- | --- |
+| 2,021 | 21 | Saudi Arabian Grand Prix | 1 | 20 |
+| 2,023 | 3 | Australian Grand Prix | 1 | 20 |
+| 2,024 | 8 | Monaco Grand Prix | 1 | 20 |
+
+---
+
+### I4. OI-7 status rows now classified as DNF
+
+**Question:** Are Stalled/Seat/Driver Seat/Not restarted rows now is_dnf = 1?
+
+**Interpretation guide:**  
+Expected: all 6 confirmed resultIds show is_dnf = 1.
+resultIds: 327 (Glock/Driver Seat), 1973 (Pizzonia/Launch control),
+2622 (Häkkinen/Stalled), 20098 (Rathmann/Stalled),
+3083 (de la Rosa/Not restarted), 23533 (Pérez/Seat).
+
+**Results:** 6 rows
+
+| resultId | year | race_name | full_name | positionText | status | is_dnf |
+| --- | --- | --- | --- | --- | --- | --- |
+| 327 | 2,008 | Japanese Grand Prix | Timo Glock | R | Driver Seat | 1 |
+| 1,973 | 2,003 | Spanish Grand Prix | Antônio Pizzonia | R | Launch control | 1 |
+| 2,622 | 2,001 | Brazilian Grand Prix | Mika Häkkinen | R | Stalled | 1 |
+| 3,083 | 2,000 | Monaco Grand Prix | Pedro de la Rosa | R | Not restarted | 1 |
+| 20,098 | 1,950 | Indianapolis 500 | Dick Rathmann | R | Stalled | 1 |
+| 23,533 | 2,017 | Azerbaijan Grand Prix | Sergio Pérez | R | Seat | 1 |
+
+---
+
 ## Summary
 
-- Queries run: **21**
-- Queries failed: **0**
-- Generated: 2026-02-28 00:13:58
+- Queries run: **27**
+- Queries failed: **1**
+- Generated: 2026-03-01 13:00:57
 
 _Run `validate_data.py` after any fixes to regenerate the main quality report._

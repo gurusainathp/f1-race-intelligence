@@ -87,16 +87,18 @@ QUERIES = [
         "block": "A",
         "query_id": "A1",
         "title": "Position null vs is_dnf cross-tab",
-        "question": "Is the 41% null rate in results.position legitimate?",
+        "question": "After the position backfill fix, are there any remaining classified finishers with null position?",
         "interpret": (
-            "**Data fine / script bug** if 'null position + NOT DNF' count is 0 or tiny.\n"
-            "**Data problem** if 'null position + NOT DNF' or 'has position + DNF' counts are large."
+            "**Expected after fix:** 'null position + NOT DNF' = 0 rows.\n"
+            "clean_data.py now backfills position from positionOrder for classified\n"
+            "finishers (positionText not in R/D/E/W/F/N). If this still shows > 0,\n"
+            "re-run clean_data.py and rebuild the database."
         ),
         "sql": """
 SELECT
     CASE
         WHEN position IS NULL AND is_dnf = 1 THEN 'null position + DNF (correct)'
-        WHEN position IS NULL AND is_dnf = 0 THEN 'null position + NOT DNF (investigate)'
+        WHEN position IS NULL AND is_dnf = 0 THEN 'null position + NOT DNF (should be 0 after fix)'
         WHEN position IS NOT NULL AND is_dnf = 1 THEN 'has position + DNF (investigate)'
         WHEN position IS NOT NULL AND is_dnf = 0 THEN 'has position + finished (correct)'
     END AS case_type,
@@ -715,6 +717,166 @@ LIMIT 20
 """,
         "limit": None,
     },
+]   # end QUERIES
+
+
+# =========================================================
+# BLOCK H — grid_pit_lane flag verification (OI-2)
+# =========================================================
+QUERIES_EXTENDED = [
+    {
+        "block": "H",
+        "query_id": "H1",
+        "title": "grid_pit_lane: modern vs historic null-grid split",
+        "question": "Does grid_pit_lane correctly separate post-1995 pit-lane starts from pre-1996 data gaps?",
+        "interpret": (
+            "Expected: grid_pit_lane = 1 only for year >= 1996 rows with null grid.\n"
+            "If grid_pit_lane = 1 appears in pre-1996 rows → merge_data.py year-guard failed.\n"
+            "If grid_pit_lane = 0 for all post-1995 null-grid rows → merge step not run yet."
+        ),
+        "sql": """
+SELECT
+    CASE WHEN ra.year >= 1996 THEN 'modern (>=1996)' ELSE 'historic (<1996)' END AS era,
+    r.grid_pit_lane,
+    COUNT(*) AS row_count
+FROM results r
+JOIN races ra ON r.raceId = ra.raceId
+WHERE r.grid IS NULL
+GROUP BY era, r.grid_pit_lane
+ORDER BY era, r.grid_pit_lane
+""",
+        "limit": None,
+    },
+    {
+        "block": "H",
+        "query_id": "H2",
+        "title": "grid_pit_lane = 1 rows that scored points",
+        "question": "Are any pit-lane-start rows scoring points with no grid — or are all of them historic data gaps?",
+        "interpret": (
+            "Modern pit-lane starters (grid_pit_lane = 1) can score points — that is expected.\n"
+            "Pre-1996 rows with points AND grid IS NULL AND grid_pit_lane = 0 → historic data gap confirmed.\n"
+            "Pre-1996 rows with points AND grid_pit_lane = 1 → era-guard bug in merge_data.py."
+        ),
+        "sql": """
+SELECT
+    ra.year,
+    r.grid_pit_lane,
+    COUNT(*) AS null_grid_rows_with_points,
+    SUM(r.points) AS total_points
+FROM results r
+JOIN races ra ON r.raceId = ra.raceId
+WHERE r.grid IS NULL AND r.points > 0
+GROUP BY ra.year, r.grid_pit_lane
+ORDER BY ra.year
+""",
+        "limit": None,
+    },
+    # =========================================================
+    # BLOCK I — New flag verification (OI-3, OI-5, OI-6, OI-7)
+    # =========================================================
+    {
+        "block": "I",
+        "query_id": "I1",
+        "title": "Out-of-fuel is_dnf override: classified finishers correctly marked is_dnf = 0",
+        "question": "Are drivers officially classified (numeric positionText) no longer flagged as DNF?",
+        "interpret": (
+            "Expected after fix: 0 rows where status = 'Out of fuel' AND\n"
+            "positionText is numeric AND is_dnf = 1.\n"
+            "If rows remain → positionText override in merge_data.py did not run."
+        ),
+        "sql": """
+SELECT
+    s.status,
+    r.positionText,
+    r.is_dnf,
+    r.points,
+    COUNT(*) AS row_count
+FROM results r
+JOIN status s ON r.statusId = s.statusId
+WHERE s.status = 'Out of fuel'
+GROUP BY s.status, r.positionText, r.is_dnf, r.points
+ORDER BY r.is_dnf DESC, row_count DESC
+LIMIT 20
+""",
+        "limit": None,
+    },
+    {
+        "block": "I",
+        "query_id": "I2",
+        "title": "is_shared_drive: pre-1970 car-sharing rows flagged",
+        "question": "Are all duplicate raceId×driverId rows in the 1950s–60s correctly flagged?",
+        "interpret": (
+            "Expected: all rows with is_shared_drive = 1 have race year < 1970.\n"
+            "If is_shared_drive = 1 appears in modern years → flag logic too broad."
+        ),
+        "sql": """
+SELECT
+    ra.year,
+    ra.name AS race_name,
+    COUNT(*) AS shared_drive_rows,
+    COUNT(DISTINCT r.driverId) AS distinct_drivers
+FROM results r
+JOIN races ra ON r.raceId = ra.raceId
+WHERE r.is_shared_drive = 1
+GROUP BY ra.year, ra.name
+ORDER BY ra.year
+""",
+        "limit": None,
+    },
+    {
+        "block": "I",
+        "query_id": "I3",
+        "title": "pit_data_incomplete: races with >30% null pit duration flagged",
+        "question": "Which races are flagged as having incomplete pit stop data?",
+        "interpret": (
+            "Expected: 2023 Australian GP (70.8% null), 2021 Saudi GP (74.5%),\n"
+            "2016 Brazilian GP (58.1%) among the flagged races.\n"
+            "Column only present in master_race_table, not raw results table."
+        ),
+        "sql": """
+SELECT
+    ra.year,
+    ra.round,
+    ra.name AS race_name,
+    m.pit_data_incomplete,
+    COUNT(DISTINCT m.driverId) AS drivers
+FROM master_race_table m
+JOIN races ra ON m.raceId = ra.raceId
+WHERE m.pit_data_incomplete = 1
+GROUP BY ra.year, ra.round, ra.name, m.pit_data_incomplete
+ORDER BY ra.year, ra.round
+""",
+        "limit": None,
+    },
+    {
+        "block": "I",
+        "query_id": "I4",
+        "title": "OI-7 status rows now classified as DNF",
+        "question": "Are Stalled/Seat/Driver Seat/Not restarted rows now is_dnf = 1?",
+        "interpret": (
+            "Expected: all 6 confirmed resultIds show is_dnf = 1.\n"
+            "resultIds: 327 (Glock/Driver Seat), 1973 (Pizzonia/Launch control),\n"
+            "2622 (Häkkinen/Stalled), 20098 (Rathmann/Stalled),\n"
+            "3083 (de la Rosa/Not restarted), 23533 (Pérez/Seat)."
+        ),
+        "sql": """
+SELECT
+    r.resultId,
+    ra.year,
+    ra.name AS race_name,
+    d.full_name,
+    r.positionText,
+    s.status,
+    r.is_dnf
+FROM results r
+JOIN races ra ON r.raceId = ra.raceId
+JOIN drivers d ON r.driverId = d.driverId
+JOIN status s ON r.statusId = s.statusId
+WHERE r.resultId IN (327, 1973, 2622, 20098, 3083, 23533)
+ORDER BY r.resultId
+""",
+        "limit": None,
+    },
 ]
 
 
@@ -802,10 +964,11 @@ def generate_diagnostics_report(db_path: Path, report_path: Path) -> None:
     ]
 
     current_block = None
-    total_queries  = len(QUERIES)
+    total_queries  = len(QUERIES) + len(QUERIES_EXTENDED)
     failed_queries = 0
+    all_queries    = QUERIES + QUERIES_EXTENDED
 
-    for i, q in enumerate(QUERIES, 1):
+    for i, q in enumerate(all_queries, 1):
         # Block header
         if q["block"] != current_block:
             current_block = q["block"]
@@ -817,6 +980,8 @@ def generate_diagnostics_report(db_path: Path, report_path: Path) -> None:
                 "E": "BLOCK E — Unclassified status labels (Scorecard Check 7)",
                 "F": "BLOCK F — `qualifying.q1_ms` null 1.5% (Bonus)",
                 "G": "BLOCK G — `pit_stops` null duration 4.7% (Bonus)",
+                "H": "BLOCK H — `grid_pit_lane` flag verification (OI-2)",
+                "I": "BLOCK I — New flag verification (OI-3, OI-5, OI-6, OI-7)",
             }.get(current_block, f"BLOCK {current_block}")
             lines += [f"## {block_label}", ""]
 

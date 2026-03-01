@@ -1,6 +1,6 @@
 # Data Quality Report
 
-> **Generated:** 2026-02-28 00:36:42  
+> **Generated:** 2026-03-01 13:00:50  
 > **Source:** `data\interim`  
 > **Tables loaded:** 9  
 
@@ -30,9 +30,9 @@
 | `drivers` | 861 | 9 | 1,559 | 20.1% |
 | `lap_times` | 588,455 | 5 | 0 | 0.0% |
 | `pit_stops` | 11,371 | 5 | 534 | 0.9% |
-| `qualifying` | 10,494 | 10 | 11,826 | 11.3% |
+| `qualifying` | 10,494 | 10 | 11,781 | 11.2% |
 | `races` | 1,125 | 11 | 5,265 | 42.5% |
-| `results` | 26,759 | 21 | 124,525 | 22.2% |
+| `results` | 26,759 | 21 | 124,523 | 22.2% |
 | `status` | 139 | 2 | 0 | 0.0% |
 
 ## 2. Null Value Analysis
@@ -103,10 +103,10 @@
 
 | Column | Type | Null Count | Null % | Severity | Note |
 |--------|------|----------:|-------:|----------|------|
-| `q3_ms` | float64 | 6,865 | 65.42% | ℹ️ Justified | Q3 only exists for top-10 qualifiers post-2006 (structural ~65% null) |
-| `q2_ms` | float64 | 4,647 | 44.28% | ℹ️ Justified | Q2 only exists in 3-part qualifying introduced in 2006 |
+| `q3_ms` | float64 | 6,865 | 65.42% | ℹ️ Justified | Q3 only exists for top-10 qualifiers in 3-part format introduced 2006. Structural ~65% null for all post-2006 races; 100% null for all pre-2006 |
+| `q2_ms` | float64 | 4,625 | 44.07% | ℹ️ Justified | Q2 null expected for single-session formats (pre-1996, 2003-2005). Post-2006: driver eliminated in Q1 or did not set a time (DNS/DQ/107%) |
 | `best_quali_ms` | float64 | 157 | 1.50% | 🔍 Investigate | 1.5% null in qualifying — mirrors q1_ms nulls exactly (derived as min of q1/q2/q3) |
-| `q1_ms` | float64 | 157 | 1.50% | 🔍 Investigate | 1.5% null in qualifying — spans 1994-2024 including modern seasons. Known causes: entire races missing from Kaggle source (e.g. 1995 Australian GP — full grid null), 107% rule failures, injury/DNS entries. Not fixable in pipeline |
+| `q1_ms` | float64 | 134 | 1.28% | 🔍 Investigate | 1.5% null in qualifying — multiple causes confirmed (2026-02-28 investigation): (1) entire races missing from Kaggle source (e.g. 1995 Australian GP — full grid null); (2) 107% rule failures (driver set no time); (3) injury/DNS before Q1 began; (4) modern era (2018-2024): disqualification, crash before setting a time, mechanical failure before Q1. Not fixable in pipeline — treat as data gap |
 | `raceId` | int64 | 0 | 0.00% | ✅ Clean | — |
 | `qualifyId` | int64 | 0 | 0.00% | ✅ Clean | — |
 | `position` | int64 | 0 | 0.00% | ✅ Clean | — |
@@ -142,7 +142,7 @@
 | `fastestLap` | float64 | 18,507 | 69.16% | ℹ️ Justified | Fastest lap data standardised from 2004 season only |
 | `fastestLapTime_ms` | float64 | 18,507 | 69.16% | ℹ️ Justified | Fastest lap data standardised from 2004 season only |
 | `rank` | float64 | 18,249 | 68.20% | ℹ️ Justified | Fastest lap ranking introduced from 2019 season only |
-| `position` | float64 | 10,953 | 40.93% | 🔍 Investigate | 41% null in results — expected: all DNFs have null position. Diagnostics confirmed difference = 2 (two lapped finishers with null position in Kaggle source — use positionOrder as reliable ordering column) |
+| `position` | float64 | 10,951 | 40.92% | 🔍 Investigate | 41% null in results — expected: all DNFs have null position. Diagnostics confirmed difference = 2 (two lapped finishers with null position in Kaggle source — use positionOrder as reliable ordering column) |
 | `grid` | float64 | 1,638 | 6.12% | 🔍 Investigate | 6% null in results — grid=0 recoded to NaN with grid_pit_lane flag. Pre-1996: 0 was a missing-data sentinel (517 rows, 14 scored points). Modern: genuine pit-lane starts. Do NOT use grid alone for pre-1996 analysis |
 | `number` | float64 | 6 | 0.02% | ℹ️ Justified | Permanent driver numbers introduced in 2014 only |
 | `constructorId` | int64 | 0 | 0.00% | ✅ Clean | — |
@@ -367,24 +367,20 @@ normal_laps = lap_times[~lap_times['is_slow_lap']]
 | Category | Count | % of Results |
 |----------|------:|-------------:|
 | ✅ Finished (incl. lapped) | 15,161 | 56.7% |
-| ❌ DNF / Retirement | 11,404 | 42.6% |
-| ❓ Other / Unclassified | 194 | 0.7% |
+| ❌ DNF / Retirement | 11,409 | 42.6% |
+| ❓ Other / Unclassified | 189 | 0.7% |
 | **Total** | **26,759** | **100%** |
 
 ### ❓ Unclassified Status Breakdown
 
-> These 194 records (0.7%) did not match Finished or DNF classifiers. Review and reclassify as needed.
+> These 189 records (0.7%) did not match Finished or DNF classifiers. Review and reclassify as needed.
 
 | Status | Count | % of Other |
 |--------|------:|-----------:|
-| Not classified | 172 | 88.7% |
-| 107% Rule | 9 | 4.6% |
-| Injured | 7 | 3.6% |
-| Stalled | 2 | 1.0% |
-| Driver Seat | 1 | 0.5% |
-| Not restarted | 1 | 0.5% |
+| Not classified | 172 | 91.0% |
+| 107% Rule | 9 | 4.8% |
+| Injured | 7 | 3.7% |
 | Underweight | 1 | 0.5% |
-| Seat | 1 | 0.5% |
 
 ### Top 10 DNF Causes
 
