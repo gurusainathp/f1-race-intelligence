@@ -21,21 +21,17 @@ from pathlib import Path
 from datetime import datetime
 import sys
 
+# Add project root to sys.path to allow absolute imports from src
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 # Import shared classifiers and thresholds — single source of truth
-try:
-    from constants import (
-        DNF_KEYWORDS, FINISH_KEYWORDS, LAPPED_PATTERNS,
-        LAP_TIME_MIN_MS, LAP_TIME_WARN_MS, LAP_TIME_CORRUPT_MS, LAP_Z_THRESHOLD,
-        is_dnf as _is_dnf_fn, is_finish as _is_finish_fn,
-    )
-    _CONSTANTS_AVAILABLE = True
-except ImportError:
-    _CONSTANTS_AVAILABLE = False
-    # Fallback values if constants.py is not on the path
-    LAP_TIME_MIN_MS     = 40_000
-    LAP_TIME_WARN_MS    = 300_000
-    LAP_TIME_CORRUPT_MS = 600_000
-    LAP_Z_THRESHOLD     = 5
+from src.utils.constants import (
+    DNF_KEYWORDS, FINISH_KEYWORDS, LAPPED_PATTERNS,
+    LAP_TIME_MIN_MS, LAP_TIME_WARN_MS, LAP_TIME_CORRUPT_MS, LAP_Z_THRESHOLD,
+    is_dnf as _is_dnf_fn, is_finish as _is_finish_fn,
+)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 INTERIM_DIR = Path("data/interim")
@@ -143,41 +139,12 @@ INVESTIGATE_NULLS: dict[str, str] = {
 
 # ── Status classifiers ─────────────────────────────────────────────────────────
 # Use shared classifiers from constants.py (single source of truth).
-# Fallback inline definitions are used only if constants.py is not on the path.
 
-if _CONSTANTS_AVAILABLE:
-    def _is_dnf(label: str) -> bool:
-        return _is_dnf_fn(label)
+def _is_dnf(label: str) -> bool:
+    return _is_dnf_fn(label)
 
-    def _is_finish(label: str) -> bool:
-        return _is_finish_fn(label)
-
-else:
-    # Fallback — keep manually in sync with constants.py if that file is absent
-    _FALLBACK_DNF = [
-        "retired", "accident", "collision", "disqualified", "did not",
-        "engine", "gearbox", "hydraulics", "brakes", "wheel", "fuel",
-        "suspension", "electrical", "oil", "water", "fire", "spun off",
-        "overheating", "mechanical", "transmission", "clutch", "throttle",
-        "power unit", "exhaust", "tyre", "puncture", "damage", "withdrew",
-        "illness", "injury", "safety", "technical", "vibrations", "debris",
-        "battery", "driveshaft", "differential", "turbo", "compressor",
-        "pneumatic", "cooling", "alternator", "electronics",
-    ]
-
-    def _is_dnf(label: str) -> bool:
-        ll = label.lower()
-        if ll.startswith("+") and "lap" in ll:
-            return False
-        return any(kw in ll for kw in _FALLBACK_DNF)
-
-    def _is_finish(label: str) -> bool:
-        ll = label.lower()
-        if "finished" in ll:
-            return True
-        if ll.startswith("+") and "lap" in ll:
-            return True
-        return any(pat in ll for pat in ["lapped", "lap down"])
+def _is_finish(label: str) -> bool:
+    return _is_finish_fn(label)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

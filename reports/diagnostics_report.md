@@ -1,6 +1,6 @@
 # F1 Data Quality — Diagnostics Report
 
-> **Generated:** 2026-03-01 13:00:56  
+> **Generated:** 2026-03-01 13:45:26  
 > **Database:** `data\processed\f1_database.db`  
 > **Purpose:** Classify each scorecard failure as DATA issue or SCRIPT issue
 
@@ -894,6 +894,6 @@ resultIds: 327 (Glock/Driver Seat), 1973 (Pizzonia/Launch control),
 
 - Queries run: **27**
 - Queries failed: **1**
-- Generated: 2026-03-01 13:00:57
+- Generated: 2026-03-01 13:45:27
 
 _Run `validate_data.py` after any fixes to regenerate the main quality report._

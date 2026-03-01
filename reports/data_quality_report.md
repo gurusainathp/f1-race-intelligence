@@ -1,6 +1,6 @@
 # Data Quality Report
 
-> **Generated:** 2026-03-01 13:00:50  
+> **Generated:** 2026-03-01 13:45:20  
 > **Source:** `data\interim`  
 > **Tables loaded:** 9  
 

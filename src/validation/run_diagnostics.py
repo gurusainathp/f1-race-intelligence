@@ -36,14 +36,9 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-try:
-    from src.config import CONFIG
-    DB_PATH     = Path(CONFIG["paths"]["processed_data"]) / "f1_database.db"
-    REPORT_DIR  = Path(CONFIG["paths"].get("reports", "reports"))
-except Exception:
-    DB_PATH     = Path("data/processed/f1_database.db")
-    REPORT_DIR  = Path("reports")
-
+from src.config import CONFIG
+DB_PATH     = Path(CONFIG["paths"]["processed_data"]) / "f1_database.db"
+REPORT_DIR  = Path(CONFIG["paths"].get("reports", "reports"))
 REPORT_PATH = REPORT_DIR / "diagnostics_report.md"
 
 # ---------------------------------------------------------------------------
@@ -59,11 +54,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Lap time threshold (keep in sync with constants.py)
 # ---------------------------------------------------------------------------
-try:
-    from constants import LAP_TIME_WARN_MS, LAP_TIME_CORRUPT_MS
-except ImportError:
-    LAP_TIME_WARN_MS    = 300_000
-    LAP_TIME_CORRUPT_MS = 600_000
+from src.utils.constants import LAP_TIME_WARN_MS, LAP_TIME_CORRUPT_MS
 
 
 # ===========================================================================

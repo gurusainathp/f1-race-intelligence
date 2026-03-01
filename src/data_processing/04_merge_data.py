@@ -36,12 +36,18 @@ Run:
 import logging
 import warnings
 from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
 import yaml
 
-from constants import (
+# Add project root to sys.path to allow absolute imports from src
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from src.utils.constants import (
     compute_is_dnf_series,
     compute_dnf_type_series,
 )
