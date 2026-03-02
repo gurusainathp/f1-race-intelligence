@@ -1,6 +1,6 @@
 # Data Quality Report
 
-> **Generated:** 2026-03-02 20:22:56  
+> **Generated:** 2026-03-02 22:34:24  
 > **Source (raw):** `data\interim`  
 > **Source (features):** `data\processed`  
 > **Tables loaded:** 9  
@@ -11,7 +11,7 @@
 
 ## 0. Quality Scorecard
 
-**Overall:** ✅ PASS
+**Overall:** ❌ FAIL
 
 | # | Check | Result |
 |---|-------|:------:|
@@ -24,6 +24,7 @@
 | 7 | Feature tables: no duplicate composite keys | ✅ PASS |
 | 8 | Feature values: no impossible values (FAIL checks) | ✅ PASS |
 | 9 | Points reconciliation: no season delta > 5 pts | ✅ PASS |
+| 10 | No data leakage: post-race features in pre-race tables | ❌ FAIL |
 
 
 ## 1. Dataset Inventory
@@ -595,6 +596,64 @@ normal_laps = lap_times[~lap_times['is_slow_lap']]
 | 2023 | 2,242.0 | 2,242.0 | 0.0 | ✅ PASS |
 | 2024 | 2,443.0 | 2,443.0 | 0.0 | ✅ PASS |
 > ℹ️ **WARN seasons are advisory.** Small deltas (2–5 pts) are common in pre-1980 seasons due to car-sharing and dropped-scores rules. They do not affect model accuracy for post-1990 analysis.
+
+## 11. Data Leakage Detection
+
+**Table:** `driver_race_features` (race-level grain: one row per driver per race)
+**Total columns:** 26
+**Post-race features (outcome/execution data):** 24 defined
+**Leaked columns detected:** 10
+
+❌ **FAIL** — Found 10 post-race features in `driver_race_features`:
+
+| Leaked Column | Classification | Severity |
+|----------------|----------------|----------|
+| `avg_pit_duration_ms` | Race execution event | 🟠 High |
+| `fastest_lap_rank` | Post-race derived metric | 🟡 Medium |
+| `finish_position` | Direct outcome / target variable | 🔴 Critical |
+| `is_dnf` | Direct outcome / target variable | 🔴 Critical |
+| `is_podium` | Post-race derived metric | 🟡 Medium |
+| `is_points_finish` | Post-race derived metric | 🟡 Medium |
+| `is_winner` | Post-race derived metric | 🟡 Medium |
+| `pit_stop_count` | Race execution event | 🟠 High |
+| `points` | Direct outcome / target variable | 🔴 Critical |
+| `positions_gained` | Race execution event | 🟠 High |
+
+### Recommended Actions
+
+1. **Review feature engineering code** in `src/feature_engineering/build_features.py`
+   Look for where these columns are being added or merged into `driver_race`.
+
+2. **Identify the source** of each leaked column:
+   ```python
+   # Check which source table contributes each leaked column
+   for col in leaked_cols:
+       print(f'{col}: {driver_race_features[col].dtype}, sample:',              driver_race_features[col].iloc[0])
+   ```
+
+3. **Remove or separate** post-race features:
+   - Use them ONLY for post-race analysis (model explainability, audit)
+   - Create separate `driver_race_post_analysis` table if needed
+   - Keep `driver_race_features` clean for training only
+
+4. **Re-validate** after fixes by re-running this check
+
+### Common Leakage Patterns in F1 Data
+
+- Merging `results` table (with `points`, `position`) into feature table
+- Including pit stop counts/durations from actual race execution
+- Using fastest lap data from race history lookups
+- Computing position deltas (positions_gained) vs qualifying grid
+
+### Season-Level Tables (Advisory)
+
+| Table | Columns | Risk | Notes |
+|-------|---------|------|-------|
+| `driver_season` | 27 | ⚠️ High: 1 leaked | Aggregates derived from historical races (low leakage risk). By design, season stats are accumulated from past races. |
+| `constructor_season` | 22 | ⚠️ High: 1 leaked | Aggregates derived from historical races (low leakage risk). By design, season stats are accumulated from past races. |
+
+> ℹ️ Season-level tables are generally safe because they aggregate historical data.
+> Leakage there is harder to accomplish accidentally (happens via explicit joins).
 
 
 ────────────────────────────────────────────────────────────

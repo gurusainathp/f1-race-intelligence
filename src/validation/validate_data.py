@@ -16,6 +16,7 @@ Checks performed:
   8. Feature table duplicate keys
   9. Feature value bounds  (impossible values in derived feature columns)
  10. Points reconciliation (driver-race vs constructor-season aggregate cross-check)
+ 11. Data leakage detection (no post-race features in pre-race tables)
 """
 
 import pandas as pd
@@ -144,6 +145,28 @@ INVESTIGATE_NULLS: dict[str, str] = {}
 #   >  POINTS_WARN_DELTA  : FAIL  (meaningful discrepancy — pipeline bug)
 POINTS_PASS_DELTA = 2.0
 POINTS_WARN_DELTA = 5.0
+
+# ── Data Leakage Detection ─────────────────────────────────────────────────────
+# Features that are POST-RACE (outcome) and should NEVER appear in pre-race feature tables.
+# Pre-race tables should only contain historical/structural features known before race start.
+# POST_RACE_FEATURES are actual race outcomes or execution details that would cause leakage.
+POST_RACE_FEATURES: set[str] = {
+    # Race outcomes (should never be features for predicting race outcomes)
+    "finish_position", "position", "points", "laps", "milliseconds", "time",
+    # DNF status (the event we often try to predict)
+    "is_dnf", "dnf_type",
+    # Podium / winner / points finisher (derived outcomes)
+    "is_podium", "is_winner", "is_points_finish",
+    # Pit stop execution data (race-specific)
+    "pit_stop_count", "avg_pit_duration_ms", "total_pit_duration_ms",
+    # Lap-level data (race-specific)
+    "fastest_lap", "fastestLap", "fastest_lap_time_ms", "fastestLapTime_ms",
+    "fastest_lap_rank", "rank",
+    # Position changes during race (race outcome)
+    "positions_gained", "positions_lost",
+    # Actual lap times (race execution)
+    "lap_time_ms", "lap_times_data",
+}
 
 # ── Impossible value bounds for feature columns ─────────────────────────────────
 # Format: (table_label, column, operator, threshold, severity, note)
@@ -1376,6 +1399,159 @@ def section_points_reconciliation(
     return "\n".join(lines), scorecard_pass
 
 
+# ===========================================================================
+# Section 11: Data Leakage Detection
+# ===========================================================================
+
+def section_data_leakage(
+    feature_tables: dict[str, pd.DataFrame | None],
+) -> tuple[str, bool]:
+    """
+    Detect data leakage: check that driver_race feature table does not contain
+    post-race features (outcomes, race-specific execution details).
+
+    Leakage = using information known only AFTER the race in a pre-race
+    prediction feature table. This corrupts model validation and makes
+    performance estimates unrealistically optimistic.
+
+    Checks:
+      - driver_race: should NOT contain any POST_RACE_FEATURES
+      - driver_season: historical aggregates only — low leakage risk
+      - constructor_season: historical aggregates only — low leakage risk
+
+    Focus is on driver_race since it is the granular race-level table where
+    leakage is most likely to slip through during feature engineering.
+    """
+    lines = ["## 11. Data Leakage Detection", ""]
+
+    dr_df = feature_tables.get("driver_race")
+
+    if dr_df is None:
+        lines += [
+            "> ⚠️ `driver_race_features` not available — skipping leakage check.",
+        ]
+        return "\n".join(lines), False
+
+    # ── Check for post-race features in driver_race ──────────────────────────
+    leaked_cols = sorted(
+        set(dr_df.columns) & POST_RACE_FEATURES
+    )
+
+    passed = len(leaked_cols) == 0
+
+    lines += [
+        f"**Table:** `driver_race_features` (race-level grain: one row per driver per race)",
+        f"**Total columns:** {len(dr_df.columns)}",
+        f"**Post-race features (outcome/execution data):** {len(POST_RACE_FEATURES)} defined",
+        f"**Leaked columns detected:** {len(leaked_cols)}",
+        "",
+    ]
+
+    if passed:
+        lines += [
+            f"✅ **PASS** — No post-race features detected in `driver_race_features`.",
+            "",
+            "**Safe pre-race features detected:**",
+            "- Identifiers: `raceId`, `driverId`, `constructorId`, `race_year`, etc.",
+            "- Starting position: `grid`, `grid_pit_lane`",
+            "- Historical stats: (driver_season_*, constructor_season_* aggregates if present)",
+            "- Track/race metadata: (if available)",
+            "- Other: (driver-specific, team-specific, or race-setup features)",
+        ]
+    else:
+        lines += [
+            f"❌ **FAIL** — Found {len(leaked_cols)} post-race features in `driver_race_features`:",
+            "",
+            "| Leaked Column | Classification | Severity |",
+            "|----------------|----------------|----------|",
+        ]
+
+        for col in leaked_cols:
+            if col in {"finish_position", "position", "points", "is_dnf"}:
+                classification = "Direct outcome / target variable"
+                severity       = "🔴 Critical"
+            elif col in {"pit_stop_count", "avg_pit_duration_ms", "positions_gained"}:
+                classification = "Race execution event"
+                severity       = "🟠 High"
+            elif col in {"fastest_lap", "fastest_lap_time_ms"}:
+                classification = "Race achievement outcome"
+                severity       = "🟠 High"
+            else:
+                classification = "Post-race derived metric"
+                severity       = "🟡 Medium"
+
+            lines.append(
+                f"| `{col}` | {classification} | {severity} |"
+            )
+
+        lines += [
+            "",
+            "### Recommended Actions",
+            "",
+            "1. **Review feature engineering code** in `src/feature_engineering/build_features.py`",
+            "   Look for where these columns are being added or merged into `driver_race`.",
+            "",
+            "2. **Identify the source** of each leaked column:",
+            "   ```python",
+            "   # Check which source table contributes each leaked column",
+            "   for col in leaked_cols:",
+            "       print(f'{col}: {driver_race_features[col].dtype}, sample:', "
+            "             driver_race_features[col].iloc[0])",
+            "   ```",
+            "",
+            "3. **Remove or separate** post-race features:",
+            "   - Use them ONLY for post-race analysis (model explainability, audit)",
+            "   - Create separate `driver_race_post_analysis` table if needed",
+            "   - Keep `driver_race_features` clean for training only",
+            "",
+            "4. **Re-validate** after fixes by re-running this check",
+            "",
+            "### Common Leakage Patterns in F1 Data",
+            "",
+            "- Merging `results` table (with `points`, `position`) into feature table",
+            "- Including pit stop counts/durations from actual race execution",
+            "- Using fastest lap data from race history lookups",
+            "- Computing position deltas (positions_gained) vs qualifying grid",
+        ]
+
+    # ── Optional: advisory check on driver_season / constructor_season ───────
+    lines += [
+        "",
+        "### Season-Level Tables (Advisory)",
+        "",
+        "| Table | Columns | Risk | Notes |",
+        "|-------|---------|------|-------|",
+    ]
+
+    for tbl_key in ["driver_season", "constructor_season"]:
+        df = feature_tables.get(tbl_key)
+        if df is None:
+            lines.append(f"| `{tbl_key}` | — | — | Not available |")
+            continue
+
+        season_leaked = sorted(set(df.columns) & POST_RACE_FEATURES)
+        n_cols = len(df.columns)
+        if season_leaked:
+            risk = f"⚠️ High: {len(season_leaked)} leaked"
+        else:
+            risk = "✅ Low"
+        notes = (
+            f"Aggregates derived from historical races (low leakage risk). "
+            f"By design, season stats are accumulated from past races."
+        )
+        lines.append(
+            f"| `{tbl_key}` | {n_cols} | {risk} | {notes} |"
+        )
+
+    lines += [
+        "",
+        "> ℹ️ Season-level tables are generally safe because they aggregate historical data.",
+        "> Leakage there is harder to accomplish accidentally (happens via explicit joins).",
+    ]
+
+    return "\n".join(lines), passed
+
+
 # ── Scorecard ──────────────────────────────────────────────────────────────────
 
 def section_scorecard(checks: list[tuple[str, bool]]) -> str:
@@ -1426,6 +1602,7 @@ def generate_report() -> None:
     s_feat_dupes, feat_dupes_pass    = section_feature_duplicate_keys(feature_tables)
     s_bounds,     bounds_pass        = section_feature_bounds(feature_tables)
     s_points,     points_pass        = section_points_reconciliation(feature_tables)
+    s_leakage,    leakage_pass       = section_data_leakage(feature_tables)
 
     scorecard = section_scorecard([
         # Raw data checks
@@ -1439,6 +1616,7 @@ def generate_report() -> None:
         ("Feature tables: no duplicate composite keys",        feat_dupes_pass),
         ("Feature values: no impossible values (FAIL checks)", bounds_pass),
         ("Points reconciliation: no season delta > 5 pts",     points_pass),
+        ("No data leakage: post-race features in pre-race tables", leakage_pass),
     ])
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1476,6 +1654,7 @@ def generate_report() -> None:
         s_feat_dupes,
         s_bounds,
         s_points,
+        s_leakage,
         footer,
     ])
 
