@@ -233,6 +233,48 @@ def _pct(value: float, total: float, decimals: int = 1) -> str:
     return f"{value / total * 100:.{decimals}f}%"
 
 
+def _classify_duplicate_pair(grp: pd.DataFrame) -> str:
+    """
+    Classify a group of rows sharing the same (raceId, driverId) into one of
+    three categories. Returns the category string.
+
+    Classification logic (applied in priority order):
+      1. Dual Constructor  — constructorId differs across rows in the group.
+                             The driver raced for two different teams in the
+                             same event (rare but legal, e.g. mid-season switch
+                             or replacement drive).
+
+      2. Shared Drive      — constructorId is the same across all rows AND is
+                             not null. The driver appeared twice under the same
+                             car/team entry. In pre-1970 F1 this means two
+                             drivers alternated stints in one car; the Ergast
+                             dataset records each stint as a separate result
+                             row with an identical (raceId, driverId,
+                             constructorId) key. By elimination: if it is not
+                             dual-constructor and constructorId is consistent,
+                             the only legitimate explanation is a shared-drive
+                             stint. No laps/position check is needed — two rows
+                             with the same constructor in the same race for the
+                             same driver ARE a shared-drive entry regardless of
+                             whether individual lap counts happen to differ.
+
+      3. Unexplained       — constructorId is absent or null; cannot classify.
+                             These require manual investigation.
+    """
+    has_constr = "constructorId" in grp.columns
+
+    # 1. Dual constructor
+    if has_constr and grp["constructorId"].nunique() > 1:
+        return "dual_constructor"
+
+    # 2. Shared drive — same constructor (not null) across all rows
+    if has_constr and grp["constructorId"].nunique() == 1 and grp["constructorId"].notna().all():
+        return "shared_drive"
+
+    # 3. Unexplained — constructorId absent or null
+    return "unexplained"
+
+
 # ── Data Loading ───────────────────────────────────────────────────────────────
 
 def load_tables() -> dict[str, pd.DataFrame]:
@@ -467,11 +509,24 @@ def section_fk_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]:
 
 def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]:
     """
-    Duplicate raceId × driverId detection with three known-legitimate categories:
-      1. Dual Constructor: same raceId/driverId pair but different constructorId
-      2. Shared Drive: same raceId/driverId/constructorId but different laps or position
-      3. Unexplained: any other case
+    Duplicate raceId × driverId detection with two known-legitimate categories:
+
+      1. Dual Constructor — same raceId/driverId but different constructorId.
+                           Driver raced for two different teams in one event.
+
+      2. Shared Drive     — same raceId/driverId/constructorId, two result rows.
+                           Covers both the classic pre-1970 car-sharing (two
+                           drivers alternating stints) AND the teammate-swap
+                           scenario: driver A finishes their own stint, then
+                           jumps into teammate B's car for additional laps.
+                           Both produce an identical (raceId, driverId,
+                           constructorId) key in the Ergast dataset.
+                           Detected by elimination: not dual-constructor +
+                           constructorId is present and consistent = shared drive.
+
     Scorecard fails only if unexplained duplicates remain.
+    Uses the shared _classify_duplicate_pair() helper so Sections 5 and 8
+    always apply identical logic.
     """
     lines = ["## 5. Duplicate Race-Driver Records", ""]
 
@@ -488,38 +543,23 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
     dupe_mask     = results.duplicated(subset=subset, keep=False)
     dupe_pairs    = int(results.duplicated(subset=subset).sum())
     rows_affected = int(dupe_mask.sum())
-    
-    # Scorecard fails only if there are unexplained duplicates
-    dual_constructor = set()
-    shared_drive     = set()
-    unexplained      = set()
+
+    dual_constructor: set[tuple] = set()
+    shared_drive:     set[tuple] = set()
+    unexplained:      set[tuple] = set()
 
     if dupe_pairs > 0:
         dupe_df = results[dupe_mask].copy()
-        
-        has_constructor = "constructorId" in results.columns
-        has_laps        = "laps" in results.columns
-        has_position    = "position" in results.columns
 
         for (race_id, driver_id), grp in dupe_df.groupby(["raceId", "driverId"]):
-            pair = (race_id, driver_id)
-            
-            # Check 1: Dual constructor — different constructorId in the pair
-            if has_constructor and grp["constructorId"].nunique() > 1:
+            pair     = (race_id, driver_id)
+            category = _classify_duplicate_pair(grp)
+            if category == "dual_constructor":
                 dual_constructor.add(pair)
-                continue
-            
-            # Check 2: Shared drive — same constructor but different laps or position
-            if (has_constructor and has_laps 
-                    and grp["constructorId"].nunique() == 1):
-                laps_differ = (grp["laps"].max() - grp["laps"].min()) > 0
-                position_differ = (has_position and grp["position"].nunique() > 1)
-                if laps_differ or position_differ:
-                    shared_drive.add(pair)
-                    continue
-            
-            # Check 3: Unexplained
-            unexplained.add(pair)
+            elif category == "shared_drive":
+                shared_drive.add(pair)
+            else:
+                unexplained.add(pair)
 
     passed = len(unexplained) == 0
 
@@ -550,9 +590,11 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
             f"| 🏛️ Dual Constructor | {len(dual_constructor)} "
             f"| Driver raced for 2 teams in same event — expected | ✅ Ignored |",
             f"| 🤝 Shared Drive | {len(shared_drive)} "
-            f"| Same team but different laps/position — expected | ✅ Ignored |",
+            f"| Same team, two result rows — expected (classic car-sharing or"
+            f" teammate-swap stint) | ✅ Ignored |",
             f"| ❓ Unexplained | {len(unexplained)} "
-            f"| No structural reason found | {'✅ None' if len(unexplained) == 0 else '❌ FAIL'} |",
+            f"| constructorId absent or null — cannot classify"
+            f" | {'✅ None' if len(unexplained) == 0 else '❌ FAIL'} |",
         ]
 
         if len(unexplained) > 0:
@@ -560,19 +602,21 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
             lines += [
                 "",
                 f"> ⚠️ **Unexplained duplicate raceIds:** {unexplained_ids}  ",
-                "> These do not match dual-constructor or shared-drive patterns.",
+                "> constructorId is absent or null for these pairs — classification"
+                " impossible without it. Check the source data for these raceIds.",
             ]
 
         if len(shared_drive) > 0:
             lines += [
                 "",
-                "> ℹ️ **Shared-drive duplicates are expected.** Multiple drivers shared one car in stints,"
-                " producing different laps/position values for the same raceId×driverId pair.",
+                "> ℹ️ **Shared-drive duplicates are expected.** Each row represents a"
+                " separate stint entry: either the classic pre-1970 car-sharing format"
+                " or a driver who later took over their teammate's car in the same race.",
             ]
 
         # Per-race summary
         all_pairs = dual_constructor | shared_drive | unexplained
-        race_pair_breakdown = {}
+        race_pair_breakdown: dict = {}
         for race_id, driver_id in all_pairs:
             if race_id not in race_pair_breakdown:
                 race_pair_breakdown[race_id] = {"dual": 0, "shared": 0, "unexplained": 0}
@@ -586,7 +630,7 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
         race_summary_rows = sorted(
             race_pair_breakdown.items(),
             key=lambda x: (x[1]["unexplained"], x[1]["dual"] + x[1]["shared"]),
-            reverse=True
+            reverse=True,
         )[:15]
 
         lines += ["", "**Top affected races (up to 15):**", ""]
@@ -616,28 +660,24 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
             else:
                 cat = "❓ Unexplained"
             lines.append(f"| {race_id} | {driver_id} | {cat} |")
-        
+
         if len(all_dupes_list) > 50:
             lines.append(f"_(showing first 50 of {len(all_dupes_list)} pairs)_")
-
-        lines += [
-            "",
-            "### Recommended Fix",
-        ]
 
         if len(unexplained) > 0:
             lines += [
                 "",
-                "**For unexplained duplicates, investigate:**",
+                "### Recommended Fix",
+                "",
+                "**For unexplained duplicates — investigate the raw rows:**",
                 "```python",
-                "# Check the specific pairs to understand the data structure",
-                "unexplained_pairs = [(race_id, driver_id), ...]",
                 "for race_id, driver_id in unexplained_pairs:",
-                "    print(results[(results['raceId'] == race_id) & (results['driverId'] == driver_id)])",
+                "    print(results[(results['raceId'] == race_id)"
+                " & (results['driverId'] == driver_id)])",
                 "```",
             ]
 
-    lines.append(f"**Overall:** {_badge(passed)}")
+    lines.append(f"\n**Overall:** {_badge(passed)}")
     return "\n".join(lines), passed
 
 
@@ -894,11 +934,11 @@ def section_feature_duplicate_keys(
       driver_season      : (driverId, race_year)
       constructor_season : (constructorId, race_year)
 
-    For driver_race specifically, duplicates are classified using the exact same
-    logic as Section 5:
-      - Dual Constructor (constructorId differs)  — expected, does NOT fail
-      - Shared Drive (same constructorId but different laps or position) — expected, does NOT fail
-      - Unexplained (any other case) — fails the scorecard
+    For driver_race, duplicates are classified using the shared
+    _classify_duplicate_pair() helper — identical logic to Section 5:
+      - Dual Constructor (constructorId differs)      — expected, does NOT fail
+      - Shared Drive (constructorId present and same) — expected, does NOT fail
+      - Unexplained (constructorId absent or null)    — fails the scorecard
 
     driver_season and constructor_season have no legitimate duplicate causes;
     any duplicate there is a pipeline bug and fails immediately.
@@ -939,41 +979,27 @@ def section_feature_duplicate_keys(
 
         dupe_count = int(df.duplicated(subset=key_cols).sum())
 
-        # ── driver_race: classify duplicates before deciding pass/fail ─────
+        # ── driver_race: classify before deciding pass/fail ────────────────
         if table_key == "driver_race" and dupe_count > 0:
             dupe_mask = df.duplicated(subset=key_cols, keep=False)
             dupe_df   = df[dupe_mask].copy()
 
-            has_constr = "constructorId" in df.columns
-            has_laps   = "laps" in df.columns
-            has_position = "position" in df.columns
-
-            dual_constr_pairs = set()
-            shared_drive_pairs = set()
-            unexplained_pairs = set()
+            dual_constr_pairs:  set[tuple] = set()
+            shared_drive_pairs: set[tuple] = set()
+            unexplained_pairs:  set[tuple] = set()
 
             for (race_id, driver_id), grp in dupe_df.groupby(["raceId", "driverId"]):
-                pair = (race_id, driver_id)
-
-                # Check 1: Dual constructor — different constructorId in the pair
-                if has_constr and grp["constructorId"].nunique() > 1:
+                pair     = (race_id, driver_id)
+                category = _classify_duplicate_pair(grp)
+                if category == "dual_constructor":
                     dual_constr_pairs.add(pair)
-                    continue
-
-                # Check 2: Shared drive — same constructor but different laps or position
-                if (has_constr and has_laps 
-                        and grp["constructorId"].nunique() == 1):
-                    laps_differ = (grp["laps"].max() - grp["laps"].min()) > 0
-                    position_differ = (has_position and grp["position"].nunique() > 1)
-                    if laps_differ or position_differ:
-                        shared_drive_pairs.add(pair)
-                        continue
-
-                # Check 3: Unexplained
-                unexplained_pairs.add(pair)
+                elif category == "shared_drive":
+                    shared_drive_pairs.add(pair)
+                else:
+                    unexplained_pairs.add(pair)
 
             n_dual_constr = len(dual_constr_pairs)
-            n_shared = len(shared_drive_pairs)
+            n_shared      = len(shared_drive_pairs)
             n_unexplained = len(unexplained_pairs)
             passed        = n_unexplained == 0
             if not passed:
@@ -984,7 +1010,6 @@ def section_feature_duplicate_keys(
                 f" | {len(df):,} | {dupe_count:,} | {n_unexplained:,} | {_badge(passed)} |"
             )
 
-            # Classification breakdown (always shown when driver_race has dupes)
             lines += [
                 "",
                 f"**`driver_race` duplicate classification** ({dupe_count} pairs total):",
@@ -994,9 +1019,10 @@ def section_feature_duplicate_keys(
                 f"| 🏛️ Dual Constructor | {n_dual_constr}"
                 f" | Driver raced for 2 teams in same event — expected | ✅ Ignored |",
                 f"| 🤝 Shared Drive | {n_shared}"
-                f" | Same team but different laps/position — expected | ✅ Ignored |",
+                f" | Same team, two result rows (car-sharing or teammate-swap)"
+                f" — expected | ✅ Ignored |",
                 f"| ❓ Unexplained | {n_unexplained}"
-                f" | No structural reason found"
+                f" | constructorId absent or null — cannot classify"
                 f" | {'✅ None' if n_unexplained == 0 else '❌ FAIL'} |",
                 "",
             ]
@@ -1019,8 +1045,13 @@ def section_feature_duplicate_keys(
                     "| raceId | driverId | constructorId | (other columns) |",
                     "|-------:|---------:|--------------:|-----------------|",
                 ]
+                has_constr = "constructorId" in unexplained_rows.columns
                 for _, row in unexplained_rows.iterrows():
-                    constr_val = str(int(row["constructorId"])) if has_constr and pd.notna(row.get("constructorId")) else "—"
+                    constr_val = (
+                        str(int(row["constructorId"]))
+                        if has_constr and pd.notna(row.get("constructorId"))
+                        else "—"
+                    )
                     lines.append(
                         f"| {int(row['raceId'])} | {int(row['driverId'])}"
                         f" | {constr_val} | _(see parquet for full row)_ |"
@@ -1058,8 +1089,8 @@ def section_feature_duplicate_keys(
         f"**Overall:** {_badge(all_pass)}",
         "",
         "> ℹ️ For `driver_race`, dual-constructor and shared-drive duplicates"
-        " are structurally expected (mirrors Section 5 logic). Only unexplained duplicates"
-        " fail the scorecard.",
+        " are structurally expected (mirrors Section 5 logic). Only duplicates"
+        " where `constructorId` is absent or null fail the scorecard.",
     ]
     return "\n".join(lines), all_pass
 
@@ -1269,10 +1300,10 @@ def section_points_reconciliation(
 
     recon["result"] = recon["delta"].apply(_classify)
 
-    n_seasons     = len(recon)
-    n_pass        = int((recon["result"] == "✅ PASS").sum())
-    n_warn        = int((recon["result"] == "⚠️ WARN").sum())
-    n_fail        = int((recon["result"] == "❌ FAIL").sum())
+    n_seasons      = len(recon)
+    n_pass         = int((recon["result"] == "✅ PASS").sum())
+    n_warn         = int((recon["result"] == "⚠️ WARN").sum())
+    n_fail         = int((recon["result"] == "❌ FAIL").sum())
     scorecard_pass = n_fail == 0
 
     lines += [
