@@ -92,7 +92,8 @@ MASTER_TABLE_FILE = PROCESSED_DIR / "master_race_table.csv"
 DB_FILE           = PROCESSED_DIR / "f1_database.db"
 
 # Parquet output paths
-DRIVER_RACE_PARQUET        = PROCESSED_DIR / "driver_race_features.parquet"
+DRIVER_RACE_FULL_PARQUET   = PROCESSED_DIR / "driver_race_full.parquet"
+DRIVER_RACE_PRE_PARQUET    = PROCESSED_DIR / "driver_race_pre.parquet"
 DRIVER_SEASON_PARQUET      = PROCESSED_DIR / "driver_season_features.parquet"
 CONSTRUCTOR_SEASON_PARQUET = PROCESSED_DIR / "constructor_season_features.parquet"
 
@@ -903,7 +904,19 @@ def run_build_master_table(
 
     # 2.1 — Driver–Race (built from DB; shared into season builds)
     driver_race_df = build_driver_race_features(db_file)
-    _save_parquet(driver_race_df, DRIVER_RACE_PARQUET, "driver_race_features")
+    _save_parquet(driver_race_df, DRIVER_RACE_FULL_PARQUET, "driver_race_full")
+
+    # Create a pre-race version without post-race features
+    post_race_features = [
+        "finish_position", "finish_position_order", "positions_gained",
+        "points", "is_dnf", "is_podium", "is_winner", "is_points_finish",
+        "fastest_lap_rank", "avg_lap_time_ms", "lap_time_consistency",
+        "fastest_lap_ms", "pit_stop_count", "total_pit_time_ms",
+        "avg_pit_duration_ms",
+    ]
+    pre_race_cols = [c for c in driver_race_df.columns if c not in post_race_features]
+    driver_race_pre_df = driver_race_df[pre_race_cols]
+    _save_parquet(driver_race_pre_df, DRIVER_RACE_PRE_PARQUET, "driver_race_pre")
 
     # 2.2 — Driver–Season (derived from driver_race_df — no extra DB read)
     driver_season_df = build_driver_season_features(driver_race_df, db_file)
@@ -917,7 +930,8 @@ def run_build_master_table(
     log.info("build_features.py complete.")
     log.info("  master_race_table.csv          -> %s", master_table_file)
     log.info("  f1_database.db                 -> %s", db_file)
-    log.info("  driver_race_features.parquet   -> %s", DRIVER_RACE_PARQUET)
+    log.info("  driver_race_full.parquet       -> %s", DRIVER_RACE_FULL_PARQUET)
+    log.info("  driver_race_pre.parquet        -> %s", DRIVER_RACE_PRE_PARQUET)
     log.info("  driver_season_features.parquet -> %s", DRIVER_SEASON_PARQUET)
     log.info("  constructor_season.parquet     -> %s", CONSTRUCTOR_SEASON_PARQUET)
     log.info("  SQL schema                     -> %s", SCHEMA_SQL_FILE)

@@ -1,17 +1,17 @@
 # Data Quality Report
 
-> **Generated:** 2026-03-02 22:34:24  
+> **Generated:** 2026-03-03 20:46:37  
 > **Source (raw):** `data\interim`  
 > **Source (features):** `data\processed`  
 > **Tables loaded:** 9  
-> **Feature tables loaded:** 3 / 3  
+> **Feature tables loaded:** 4 / 4  
 
 ────────────────────────────────────────────────────────────
 
 
 ## 0. Quality Scorecard
 
-**Overall:** ❌ FAIL
+**Overall:** ✅ PASS
 
 | # | Check | Result |
 |---|-------|:------:|
@@ -24,7 +24,7 @@
 | 7 | Feature tables: no duplicate composite keys | ✅ PASS |
 | 8 | Feature values: no impossible values (FAIL checks) | ✅ PASS |
 | 9 | Points reconciliation: no season delta > 5 pts | ✅ PASS |
-| 10 | No data leakage: post-race features in pre-race tables | ❌ FAIL |
+| 10 | No data leakage: post-race features in pre-race tables | ✅ PASS |
 
 
 ## 1. Dataset Inventory
@@ -455,9 +455,19 @@ normal_laps = lap_times[~lap_times['is_slow_lap']]
 
 | Table | Key Columns | Rows | Duplicate Pairs | Unexplained | Result |
 |-------|-------------|-----:|----------------:|------------:|:------:|
-| `driver_race` | `raceId`, `driverId` | 26,759 | 91 | 0 | ✅ PASS |
+| `driver_race_full` | `raceId`, `driverId` | 26,759 | 91 | 0 | ✅ PASS |
 
-**`driver_race` duplicate classification** (91 pairs total):
+**`driver_race_full` duplicate classification** (91 pairs total):
+
+| Category | Pairs | Interpretation | Scorecard |
+|----------|------:|----------------|:---------:|
+| 🏛️ Dual Constructor | 16 | Driver raced for 2 teams in same event — expected | ✅ Ignored |
+| 🤝 Shared Drive | 69 | Same team, two result rows (car-sharing or teammate-swap) — expected | ✅ Ignored |
+| ❓ Unexplained | 0 | constructorId absent or null — cannot classify | ✅ None |
+
+| `driver_race_pre` | `raceId`, `driverId` | 26,759 | 91 | 0 | ✅ PASS |
+
+**`driver_race_pre` duplicate classification** (91 pairs total):
 
 | Category | Pairs | Interpretation | Scorecard |
 |----------|------:|----------------|:---------:|
@@ -482,15 +492,16 @@ normal_laps = lap_times[~lap_times['is_slow_lap']]
 | `constructor_season` | `driver_count` | `driver_count` < 1 | 0 | ❌ FAIL | ✅ PASS |
 | `constructor_season` | `driver_spread_avg_finish` | `driver_spread_avg_finish` < 0 | 0 | ⚠️ WARN | ✅ PASS |
 | `constructor_season` | `driver_spread_total_points` | `driver_spread_total_points` < 0 | 0 | ⚠️ WARN | ✅ PASS |
-| `driver_race` | `grid` | `grid` < 0 | 0 | ❌ FAIL | ✅ PASS |
-| `driver_race` | `finish_position` | `finish_position` < 1 | 0 | ❌ FAIL | ✅ PASS |
-| `driver_race` | `positions_gained` | `positions_gained` < -30 | 0 | ❌ FAIL | ✅ PASS |
-| `driver_race` | `positions_gained` | `positions_gained` > 33 | 0 | ❌ FAIL | ✅ PASS |
-| `driver_race` | `points` | `points` < 0 | 0 | ❌ FAIL | ✅ PASS |
-| `driver_race` | `pit_stop_count` | `pit_stop_count` < 0 | 0 | ❌ FAIL | ✅ PASS |
-| `driver_race` | `avg_pit_duration_ms` | `avg_pit_duration_ms` < 0 | 0 | ❌ FAIL | ✅ PASS |
-| `driver_race` | `is_dnf` | `is_dnf` < 0 | 0 | ❌ FAIL | ✅ PASS |
-| `driver_race` | `is_dnf` | `is_dnf` > 1 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race_full` | `grid` | `grid` < 0 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race_full` | `finish_position` | `finish_position` < 1 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race_full` | `positions_gained` | `positions_gained` < -30 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race_full` | `positions_gained` | `positions_gained` > 33 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race_full` | `points` | `points` < 0 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race_full` | `pit_stop_count` | `pit_stop_count` < 0 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race_full` | `avg_pit_duration_ms` | `avg_pit_duration_ms` < 0 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race_full` | `is_dnf` | `is_dnf` < 0 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race_full` | `is_dnf` | `is_dnf` > 1 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race_pre` | `grid` | `grid` < 0 | 0 | ❌ FAIL | ✅ PASS |
 | `driver_season` | `dnf_rate` | `dnf_rate` < 0 | 0 | ❌ FAIL | ✅ PASS |
 | `driver_season` | `dnf_rate` | `dnf_rate` > 1 | 0 | ❌ FAIL | ✅ PASS |
 | `driver_season` | `win_rate` | `win_rate` > 1 | 0 | ❌ FAIL | ✅ PASS |
@@ -599,51 +610,19 @@ normal_laps = lap_times[~lap_times['is_slow_lap']]
 
 ## 11. Data Leakage Detection
 
-**Table:** `driver_race_features` (race-level grain: one row per driver per race)
-**Total columns:** 26
+**Table:** `driver_race_pre.parquet` (race-level grain: one row per driver per race)
+**Total columns:** 11
 **Post-race features (outcome/execution data):** 24 defined
-**Leaked columns detected:** 10
+**Leaked columns detected:** 0
 
-❌ **FAIL** — Found 10 post-race features in `driver_race_features`:
+✅ **PASS** — No post-race features detected in `driver_race_pre.parquet`.
 
-| Leaked Column | Classification | Severity |
-|----------------|----------------|----------|
-| `avg_pit_duration_ms` | Race execution event | 🟠 High |
-| `fastest_lap_rank` | Post-race derived metric | 🟡 Medium |
-| `finish_position` | Direct outcome / target variable | 🔴 Critical |
-| `is_dnf` | Direct outcome / target variable | 🔴 Critical |
-| `is_podium` | Post-race derived metric | 🟡 Medium |
-| `is_points_finish` | Post-race derived metric | 🟡 Medium |
-| `is_winner` | Post-race derived metric | 🟡 Medium |
-| `pit_stop_count` | Race execution event | 🟠 High |
-| `points` | Direct outcome / target variable | 🔴 Critical |
-| `positions_gained` | Race execution event | 🟠 High |
-
-### Recommended Actions
-
-1. **Review feature engineering code** in `src/feature_engineering/build_features.py`
-   Look for where these columns are being added or merged into `driver_race`.
-
-2. **Identify the source** of each leaked column:
-   ```python
-   # Check which source table contributes each leaked column
-   for col in leaked_cols:
-       print(f'{col}: {driver_race_features[col].dtype}, sample:',              driver_race_features[col].iloc[0])
-   ```
-
-3. **Remove or separate** post-race features:
-   - Use them ONLY for post-race analysis (model explainability, audit)
-   - Create separate `driver_race_post_analysis` table if needed
-   - Keep `driver_race_features` clean for training only
-
-4. **Re-validate** after fixes by re-running this check
-
-### Common Leakage Patterns in F1 Data
-
-- Merging `results` table (with `points`, `position`) into feature table
-- Including pit stop counts/durations from actual race execution
-- Using fastest lap data from race history lookups
-- Computing position deltas (positions_gained) vs qualifying grid
+**Safe pre-race features detected:**
+- Identifiers: `raceId`, `driverId`, `constructorId`, `race_year`, etc.
+- Starting position: `grid`, `grid_pit_lane`
+- Historical stats: (driver_season_*, constructor_season_* aggregates if present)
+- Track/race metadata: (if available)
+- Other: (driver-specific, team-specific, or race-setup features)
 
 ### Season-Level Tables (Advisory)
 

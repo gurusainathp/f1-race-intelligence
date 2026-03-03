@@ -51,7 +51,8 @@ PROCESSED_DIR = Path("data/processed")
 REPORT_PATH   = Path("reports/data_quality/data_quality_report.md")
 
 # Parquet feature store paths (all live in data/processed/)
-DRIVER_RACE_PARQUET        = PROCESSED_DIR / "driver_race_features.parquet"
+DRIVER_RACE_FULL_PARQUET   = PROCESSED_DIR / "driver_race_full.parquet"
+DRIVER_RACE_PRE_PARQUET    = PROCESSED_DIR / "driver_race_pre.parquet"
 DRIVER_SEASON_PARQUET      = PROCESSED_DIR / "driver_season_features.parquet"
 CONSTRUCTOR_SEASON_PARQUET = PROCESSED_DIR / "constructor_season_features.parquet"
 
@@ -173,16 +174,18 @@ POST_RACE_FEATURES: set[str] = {
 # operator: one of '<', '>', '=='
 # severity: 'FAIL' triggers scorecard failure; 'WARN' is advisory only
 BOUNDS_CHECKS = [
-    # driver_race_features
-    ("driver_race", "grid",             "<",  0,    "FAIL", "Grid position cannot be negative"),
-    ("driver_race", "finish_position",  "<",  1,    "FAIL", "Finish position cannot be below 1"),
-    ("driver_race", "positions_gained", "<", -30,   "FAIL", "Losing 30+ places in one race is impossible"),
-    ("driver_race", "positions_gained", ">",  33,   "FAIL", "Gaining 33+ places in one race is impossible (max grid ~20 cars)"),
-    ("driver_race", "points",           "<",  0,    "FAIL", "Race points cannot be negative"),
-    ("driver_race", "pit_stop_count",   "<",  0,    "FAIL", "Pit stop count cannot be negative"),
-    ("driver_race", "avg_pit_duration_ms", "<", 0,  "FAIL", "Pit duration cannot be negative"),
-    ("driver_race", "is_dnf",           "<",  0,    "FAIL", "is_dnf must be 0 or 1"),
-    ("driver_race", "is_dnf",           ">",  1,    "FAIL", "is_dnf must be 0 or 1"),
+    # driver_race_full
+    ("driver_race_full", "grid",             "<",  0,    "FAIL", "Grid position cannot be negative"),
+    ("driver_race_full", "finish_position",  "<",  1,    "FAIL", "Finish position cannot be below 1"),
+    ("driver_race_full", "positions_gained", "<", -30,   "FAIL", "Losing 30+ places in one race is impossible"),
+    ("driver_race_full", "positions_gained", ">",  33,   "FAIL", "Gaining 33+ places in one race is impossible (max grid ~20 cars)"),
+    ("driver_race_full", "points",           "<",  0,    "FAIL", "Race points cannot be negative"),
+    ("driver_race_full", "pit_stop_count",   "<",  0,    "FAIL", "Pit stop count cannot be negative"),
+    ("driver_race_full", "avg_pit_duration_ms", "<", 0,  "FAIL", "Pit duration cannot be negative"),
+    ("driver_race_full", "is_dnf",           "<",  0,    "FAIL", "is_dnf must be 0 or 1"),
+    ("driver_race_full", "is_dnf",           ">",  1,    "FAIL", "is_dnf must be 0 or 1"),
+    # driver_race_pre
+    ("driver_race_pre", "grid",             "<",  0,    "FAIL", "Grid position cannot be negative"),
     # driver_season_features
     ("driver_season", "dnf_rate",       "<",  0,    "FAIL", "Rate cannot be negative"),
     ("driver_season", "dnf_rate",       ">",  1,    "FAIL", "Rate cannot exceed 1.0"),
@@ -328,7 +331,8 @@ def load_feature_tables() -> dict[str, pd.DataFrame | None]:
     handle None gracefully and report the file as unavailable rather than crashing.
     """
     mapping = {
-        "driver_race":        DRIVER_RACE_PARQUET,
+        "driver_race_full":   DRIVER_RACE_FULL_PARQUET,
+        "driver_race_pre":    DRIVER_RACE_PRE_PARQUET,
         "driver_season":      DRIVER_SEASON_PARQUET,
         "constructor_season": CONSTRUCTOR_SEASON_PARQUET,
     }
@@ -970,7 +974,8 @@ def section_feature_duplicate_keys(
     all_pass = True
 
     key_map = {
-        "driver_race":        ["raceId", "driverId"],
+        "driver_race_full":   ["raceId", "driverId"],
+        "driver_race_pre":    ["raceId", "driverId"],
         "driver_season":      ["driverId", "race_year"],
         "constructor_season": ["constructorId", "race_year"],
     }
@@ -1003,7 +1008,7 @@ def section_feature_duplicate_keys(
         dupe_count = int(df.duplicated(subset=key_cols).sum())
 
         # ── driver_race: classify before deciding pass/fail ────────────────
-        if table_key == "driver_race" and dupe_count > 0:
+        if table_key.startswith("driver_race") and dupe_count > 0:
             dupe_mask = df.duplicated(subset=key_cols, keep=False)
             dupe_df   = df[dupe_mask].copy()
 
@@ -1035,7 +1040,7 @@ def section_feature_duplicate_keys(
 
             lines += [
                 "",
-                f"**`driver_race` duplicate classification** ({dupe_count} pairs total):",
+                f"**`{table_key}` duplicate classification** ({dupe_count} pairs total):",
                 "",
                 "| Category | Pairs | Interpretation | Scorecard |",
                 "|----------|------:|----------------|:---------:|",
@@ -1063,7 +1068,7 @@ def section_feature_duplicate_keys(
                     .head(10)
                 )
                 lines += [
-                    "**Unexplained duplicate rows in `driver_race` (up to 10):**",
+                    f"**Unexplained duplicate rows in `{table_key}` (up to 10):**",
                     "",
                     "| raceId | driverId | constructorId | (other columns) |",
                     "|-------:|---------:|--------------:|-----------------|",
@@ -1251,18 +1256,18 @@ def section_points_reconciliation(
     Scorecard fails only if any season has delta > POINTS_WARN_DELTA.
 
     Sources:
-      driver_race_features        : grain = driver × race  — sum `points` per season
+      driver_race_full_features : grain = driver × race  — sum `points` per season
       constructor_season_features : grain = constructor × season — sum `total_points` per season
     """
     lines = ["## 10. Points Reconciliation — Driver vs Constructor Totals", ""]
 
-    dr_df   = feature_tables.get("driver_race")
+    dr_df   = feature_tables.get("driver_race_full")
     con_df  = feature_tables.get("constructor_season")
 
     # ── Availability guard ──────────────────────────────────────────────────
     if dr_df is None or con_df is None:
         missing = []
-        if dr_df  is None: missing.append("`driver_race_features`")
+        if dr_df  is None: missing.append("`driver_race_full_features`")
         if con_df is None: missing.append("`constructor_season_features`")
         msg = ", ".join(missing)
         lines += [
@@ -1276,8 +1281,8 @@ def section_points_reconciliation(
     con_year_col = "race_year"
 
     missing_cols: list[str] = []
-    if "points"       not in dr_df.columns:  missing_cols.append("driver_race.points")
-    if dr_year_col    not in dr_df.columns:  missing_cols.append(f"driver_race.{dr_year_col}")
+    if "points"       not in dr_df.columns:  missing_cols.append("driver_race_full.points")
+    if dr_year_col    not in dr_df.columns:  missing_cols.append(f"driver_race_full.{dr_year_col}")
     if "total_points" not in con_df.columns: missing_cols.append("constructor_season.total_points")
     if con_year_col   not in con_df.columns: missing_cols.append(f"constructor_season.{con_year_col}")
 
@@ -1382,9 +1387,9 @@ def section_points_reconciliation(
                 "",
                 "```python",
                 f"# Drill into {int(row['season'])} discrepancy",
-                f"dr  = driver_race_df[driver_race_df['race_year'] == {int(row['season'])}]",
+                f"dr_full  = driver_race_full_df[driver_race_full_df['race_year'] == {int(row['season'])}]",
                 f"con = constructor_season_df[constructor_season_df['race_year'] == {int(row['season'])}]",
-                f"print('Driver total   :', dr['points'].sum())",
+                f"print('Driver total   :', dr_full['points'].sum())",
                 f"print('Constructor total:', con['total_points'].sum())",
                 "```",
                 "",
@@ -1407,7 +1412,7 @@ def section_data_leakage(
     feature_tables: dict[str, pd.DataFrame | None],
 ) -> tuple[str, bool]:
     """
-    Detect data leakage: check that driver_race feature table does not contain
+    Detect data leakage: check that driver_race_pre feature table does not contain
     post-race features (outcomes, race-specific execution details).
 
     Leakage = using information known only AFTER the race in a pre-race
@@ -1415,24 +1420,24 @@ def section_data_leakage(
     performance estimates unrealistically optimistic.
 
     Checks:
-      - driver_race: should NOT contain any POST_RACE_FEATURES
+      - driver_race_pre: should NOT contain any POST_RACE_FEATURES
       - driver_season: historical aggregates only — low leakage risk
       - constructor_season: historical aggregates only — low leakage risk
 
-    Focus is on driver_race since it is the granular race-level table where
+    Focus is on driver_race_pre since it is the granular race-level table where
     leakage is most likely to slip through during feature engineering.
     """
     lines = ["## 11. Data Leakage Detection", ""]
 
-    dr_df = feature_tables.get("driver_race")
+    dr_df = feature_tables.get("driver_race_pre")
 
     if dr_df is None:
         lines += [
-            "> ⚠️ `driver_race_features` not available — skipping leakage check.",
+            "> ⚠️ `driver_race_pre.parquet` not available — skipping leakage check.",
         ]
         return "\n".join(lines), False
 
-    # ── Check for post-race features in driver_race ──────────────────────────
+    # ── Check for post-race features in driver_race_pre ────────────────────
     leaked_cols = sorted(
         set(dr_df.columns) & POST_RACE_FEATURES
     )
@@ -1440,7 +1445,7 @@ def section_data_leakage(
     passed = len(leaked_cols) == 0
 
     lines += [
-        f"**Table:** `driver_race_features` (race-level grain: one row per driver per race)",
+        f"**Table:** `driver_race_pre.parquet` (race-level grain: one row per driver per race)",
         f"**Total columns:** {len(dr_df.columns)}",
         f"**Post-race features (outcome/execution data):** {len(POST_RACE_FEATURES)} defined",
         f"**Leaked columns detected:** {len(leaked_cols)}",
@@ -1449,7 +1454,7 @@ def section_data_leakage(
 
     if passed:
         lines += [
-            f"✅ **PASS** — No post-race features detected in `driver_race_features`.",
+            f"✅ **PASS** — No post-race features detected in `driver_race_pre.parquet`.",
             "",
             "**Safe pre-race features detected:**",
             "- Identifiers: `raceId`, `driverId`, `constructorId`, `race_year`, etc.",
@@ -1460,7 +1465,7 @@ def section_data_leakage(
         ]
     else:
         lines += [
-            f"❌ **FAIL** — Found {len(leaked_cols)} post-race features in `driver_race_features`:",
+            f"❌ **FAIL** — Found {len(leaked_cols)} post-race features in `driver_race_pre.parquet`:",
             "",
             "| Leaked Column | Classification | Severity |",
             "|----------------|----------------|----------|",
@@ -1489,20 +1494,20 @@ def section_data_leakage(
             "### Recommended Actions",
             "",
             "1. **Review feature engineering code** in `src/feature_engineering/build_features.py`",
-            "   Look for where these columns are being added or merged into `driver_race`.",
+            "   Look for where these columns are being added or merged into `driver_race_pre`.",
             "",
             "2. **Identify the source** of each leaked column:",
             "   ```python",
             "   # Check which source table contributes each leaked column",
             "   for col in leaked_cols:",
-            "       print(f'{col}: {driver_race_features[col].dtype}, sample:', "
-            "             driver_race_features[col].iloc[0])",
+            "       print(f'{col}: {driver_race_pre_df[col].dtype}, sample:', "
+            "             driver_race_pre_df[col].iloc[0])",
             "   ```",
             "",
             "3. **Remove or separate** post-race features:",
             "   - Use them ONLY for post-race analysis (model explainability, audit)",
             "   - Create separate `driver_race_post_analysis` table if needed",
-            "   - Keep `driver_race_features` clean for training only",
+            "   - Keep `driver_race_pre_features` clean for training only",
             "",
             "4. **Re-validate** after fixes by re-running this check",
             "",
