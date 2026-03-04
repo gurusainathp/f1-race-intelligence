@@ -1,8 +1,8 @@
 # Data Quality Report
 
-> **Generated:** 2026-03-04 20:10:37  
+> **Generated:** 2026-03-04 23:10:34  
 > **Source (raw):** `data\interim`  
-> **Source (features):** `data\processed`  
+> **Source (features):** `data\processed\features`  
 > **Tables loaded:** 9  
 > **Feature tables loaded:** 6 / 6  
 

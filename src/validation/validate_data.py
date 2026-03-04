@@ -49,15 +49,16 @@ except ImportError:
 # ── Configuration ──────────────────────────────────────────────────────────────
 INTERIM_DIR   = Path("data/interim")
 PROCESSED_DIR = Path("data/processed")
+FEATURES_DIR    = PROCESSED_DIR / "features"
 REPORT_PATH   = Path("reports/data_quality/data_quality_report.md")
 
 # Parquet feature store paths (all live in data/processed/)
-DRIVER_RACE_FULL_PARQUET        = PROCESSED_DIR / "driver_race_full.parquet"
-DRIVER_RACE_PRE_PARQUET         = PROCESSED_DIR / "driver_race_pre.parquet"
-DRIVER_SEASON_PARQUET           = PROCESSED_DIR / "driver_season_features.parquet"
-CONSTRUCTOR_SEASON_PARQUET      = PROCESSED_DIR / "constructor_season_features.parquet"
-DRIVER_RACE_ROLLING_PARQUET     = PROCESSED_DIR / "driver_race_rolling.parquet"
-CONSTRUCTOR_RACE_ROLLING_PARQUET = PROCESSED_DIR / "constructor_race_rolling.parquet"
+DRIVER_RACE_FULL_PARQUET        = FEATURES_DIR / "driver_race_full.parquet"
+DRIVER_RACE_PRE_PARQUET         = FEATURES_DIR / "driver_race_pre.parquet"
+DRIVER_SEASON_PARQUET           = FEATURES_DIR / "driver_season_features.parquet"
+CONSTRUCTOR_SEASON_PARQUET      = FEATURES_DIR / "constructor_season_features.parquet"
+DRIVER_RACE_ROLLING_PARQUET     = FEATURES_DIR / "driver_race_rolling.parquet"
+CONSTRUCTOR_RACE_ROLLING_PARQUET = FEATURES_DIR / "constructor_race_rolling.parquet"
 
 # Foreign key relationships: (child_table, child_col) → (parent_table, parent_col)
 FK_CHECKS = [
@@ -1187,7 +1188,7 @@ def section_scorecard(checks: list[tuple[str, bool]]) -> str:
 def generate_report() -> None:
     print("\n── Data Quality Validator ──────────────────────────────")
     print(f"  Source (raw) : {INTERIM_DIR.resolve()}")
-    print(f"  Source (feat): {PROCESSED_DIR.resolve()}")
+    print(f"  Source (feat): {FEATURES_DIR.resolve()}")
     print(f"  Output       : {REPORT_PATH.resolve()}")
     print("")
 
@@ -1234,7 +1235,7 @@ def generate_report() -> None:
         "",
         f"> **Generated:** {timestamp}  ",
         f"> **Source (raw):** `{INTERIM_DIR}`  ",
-        f"> **Source (features):** `{PROCESSED_DIR}`  ",
+        f"> **Source (features):** `{FEATURES_DIR}`  ",
         f"> **Tables loaded:** {len(tables)}  ",
         f"> **Feature tables loaded:** {sum(v is not None for v in feature_tables.values())} / {len(feature_tables)}  ",
         "",

@@ -27,12 +27,12 @@ Reads:
 Writes:
   data/processed/master_race_table.csv
   data/processed/f1_database.db
-  data/processed/driver_race_full.parquet
-  data/processed/driver_race_pre.parquet
-  data/processed/driver_season_features.parquet
-  data/processed/constructor_season_features.parquet
-  data/processed/driver_race_rolling.parquet
-  data/processed/constructor_race_rolling.parquet
+  data/processed/features/driver_race_full.parquet
+  data/processed/features/driver_race_pre.parquet
+  data/processed/features/driver_season_features.parquet
+  data/processed/features/constructor_season_features.parquet
+  data/processed/features/driver_race_rolling.parquet
+  data/processed/features/constructor_race_rolling.parquet
 
 Pipeline position:
   src/data_processing/02_clean_data.py -> src/data_processing/04_merge_data.py -> [THIS FILE]
@@ -92,18 +92,19 @@ _CONFIG = _load_config()
 INTERIM_DIR   = Path(_CONFIG.get("paths", {}).get("interim_data",   "data/interim"))
 PROCESSED_DIR = Path(_CONFIG.get("paths", {}).get("processed_data", "data/processed"))
 SQL_DIR       = Path(_CONFIG.get("paths", {}).get("sql_dir",        "sql"))
+FEATURES_DIR    = PROCESSED_DIR / "features"
 
 MERGED_FILE       = INTERIM_DIR   / "cleaned_merged_data.csv"
 MASTER_TABLE_FILE = PROCESSED_DIR / "master_race_table.csv"
 DB_FILE           = PROCESSED_DIR / "f1_database.db"
 
 # Parquet output paths
-DRIVER_RACE_FULL_PARQUET        = PROCESSED_DIR / "driver_race_full.parquet"
-DRIVER_RACE_PRE_PARQUET         = PROCESSED_DIR / "driver_race_pre.parquet"
-DRIVER_SEASON_PARQUET           = PROCESSED_DIR / "driver_season_features.parquet"
-CONSTRUCTOR_SEASON_PARQUET      = PROCESSED_DIR / "constructor_season_features.parquet"
-DRIVER_RACE_ROLLING_PARQUET     = PROCESSED_DIR / "driver_race_rolling.parquet"      # NEW (2.4)
-CONSTRUCTOR_RACE_ROLLING_PARQUET = PROCESSED_DIR / "constructor_race_rolling.parquet" # NEW (2.5)
+DRIVER_RACE_FULL_PARQUET        = FEATURES_DIR / "driver_race_full.parquet"
+DRIVER_RACE_PRE_PARQUET         = FEATURES_DIR / "driver_race_pre.parquet"
+DRIVER_SEASON_PARQUET           = FEATURES_DIR / "driver_season_features.parquet"
+CONSTRUCTOR_SEASON_PARQUET      = FEATURES_DIR / "constructor_season_features.parquet"
+DRIVER_RACE_ROLLING_PARQUET     = FEATURES_DIR / "driver_race_rolling.parquet"      # NEW (2.4)
+CONSTRUCTOR_RACE_ROLLING_PARQUET = FEATURES_DIR / "constructor_race_rolling.parquet" # NEW (2.5)
 
 
 # ---------------------------------------------------------------------------
