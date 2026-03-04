@@ -3,11 +3,19 @@ src/feature_engineering/build_features.py
 ------------------------------------------
 Produces the final analysis-ready master race table and loads all
 cleaned tables into a SQLite database for SQL-based analysis.
-Also builds three feature-store parquet files for modelling:
+Also builds five feature-store parquet files for modelling:
 
   data/processed/driver_race_features.parquet       (2.1)
   data/processed/driver_season_features.parquet     (2.2)
   data/processed/constructor_season_features.parquet(2.3)
+  data/processed/driver_race_rolling.parquet        (2.4)
+  data/processed/constructor_race_rolling.parquet   (2.5)
+
+Rolling feature tables (2.4, 2.5) contain cumulative within-season stats
+up to (but NOT including) the current race — i.e. all values are shifted
+by 1 round so race N only sees rounds 1..N-1. These are the primary
+in-season signal. Season tables (2.2, 2.3) provide the secondary signal
+from the full prior season.
 
 Reads:
   data/interim/cleaned_merged_data.csv    (from src/data_processing/04_merge_data.py)
@@ -17,16 +25,14 @@ Reads:
   data/processed/f1_database.db          (for parquet building — built in Step 2)
 
 Writes:
-  data/processed/master_race_table.csv   — denormalized table, one row
-                                           per driver per race
-  data/processed/f1_database.db          — SQLite database containing:
-                                             - all 9 cleaned source tables
-                                               (incl. status lookup)
-                                             - master_race_table
-                                             - 4 analytical views
-  data/processed/driver_race_features.parquet
+  data/processed/master_race_table.csv
+  data/processed/f1_database.db
+  data/processed/driver_race_full.parquet
+  data/processed/driver_race_pre.parquet
   data/processed/driver_season_features.parquet
   data/processed/constructor_season_features.parquet
+  data/processed/driver_race_rolling.parquet
+  data/processed/constructor_race_rolling.parquet
 
 Pipeline position:
   src/data_processing/02_clean_data.py -> src/data_processing/04_merge_data.py -> [THIS FILE]
@@ -92,10 +98,12 @@ MASTER_TABLE_FILE = PROCESSED_DIR / "master_race_table.csv"
 DB_FILE           = PROCESSED_DIR / "f1_database.db"
 
 # Parquet output paths
-DRIVER_RACE_FULL_PARQUET   = PROCESSED_DIR / "driver_race_full.parquet"
-DRIVER_RACE_PRE_PARQUET    = PROCESSED_DIR / "driver_race_pre.parquet"
-DRIVER_SEASON_PARQUET      = PROCESSED_DIR / "driver_season_features.parquet"
-CONSTRUCTOR_SEASON_PARQUET = PROCESSED_DIR / "constructor_season_features.parquet"
+DRIVER_RACE_FULL_PARQUET        = PROCESSED_DIR / "driver_race_full.parquet"
+DRIVER_RACE_PRE_PARQUET         = PROCESSED_DIR / "driver_race_pre.parquet"
+DRIVER_SEASON_PARQUET           = PROCESSED_DIR / "driver_season_features.parquet"
+CONSTRUCTOR_SEASON_PARQUET      = PROCESSED_DIR / "constructor_season_features.parquet"
+DRIVER_RACE_ROLLING_PARQUET     = PROCESSED_DIR / "driver_race_rolling.parquet"      # NEW (2.4)
+CONSTRUCTOR_RACE_ROLLING_PARQUET = PROCESSED_DIR / "constructor_race_rolling.parquet" # NEW (2.5)
 
 
 # ---------------------------------------------------------------------------
@@ -532,8 +540,6 @@ def build_driver_race_features(db_path: Path = DB_FILE) -> pd.DataFrame:
     log.info("  master_race_table pulled: %d rows", len(mdf))
 
     # ── Fresh pit stop aggregation from raw pit_stops table ─────────────────
-    # Prefer this over master pre-aggregated values — it's always up-to-date
-    # and lets us count stops precisely even when duration is null.
     pit_query = """
         SELECT
             raceId,
@@ -557,7 +563,6 @@ def build_driver_race_features(db_path: Path = DB_FILE) -> pd.DataFrame:
     # ── Merge pit aggregates onto master ────────────────────────────────────
     if pit_available:
         df = mdf.merge(pit_agg, on=["raceId", "driverId"], how="left")
-        # Fresh aggregation takes priority; fill gaps with master pre-agg
         df["pit_stop_count"]    = df["pit_stop_count"].fillna(df["pit_stop_count_master"])
         df["total_pit_time_ms"] = df["total_pit_time_ms"].fillna(df["total_pit_time_ms_master"])
         df["avg_pit_duration_ms"] = df["avg_pit_duration_ms"].fillna(df["avg_pit_duration_ms_master"])
@@ -568,7 +573,6 @@ def build_driver_race_features(db_path: Path = DB_FILE) -> pd.DataFrame:
         df["avg_pit_duration_ms"] = df["avg_pit_duration_ms_master"]
 
     # ── Derived: positions gained ────────────────────────────────────────────
-    # Positive = moved forward; null grid or DNF → NaN
     df["positions_gained"] = np.where(
         df["grid"].notna() & df["finish_position"].notna() & (df["grid"] > 0),
         df["grid"] - df["finish_position"],
@@ -622,8 +626,16 @@ def build_driver_season_features(
     """
     Build driver_season_features.parquet — one row per driver per season.
 
-    All aggregates are derived exclusively from driver_race_features so the
-    dependency chain is explicit and reproducible.
+    All aggregates are full-season summaries of season N. When used as
+    model features, join season N-1 stats onto season N races so there
+    is no leakage (the entire prior season is known before race 1 of
+    season N).
+
+    Note on naming: pit duration is stored as `season_avg_pit_duration_ms`
+    (not `avg_pit_duration_ms`) to avoid a name collision with the
+    POST_RACE_FEATURES set in validate_data.py, which flags race-level
+    pit data as leakage. The season aggregate is safe because it
+    summarises a completed prior season.
 
     Columns produced
     ----------------
@@ -637,7 +649,7 @@ def build_driver_season_features(
     Pace         : avg_positions_gained, avg_qualifying_position
                    avg_qualifying_gap_ms, avg_lap_time_ms
     Consistency  : avg_lap_time_consistency
-    Pit          : avg_pit_stop_count, avg_pit_duration_ms
+    Pit          : avg_pit_stop_count, season_avg_pit_duration_ms  ← renamed
     """
     log.info("Building driver_season_features ...")
 
@@ -651,7 +663,7 @@ def build_driver_season_features(
     # ── Volume ───────────────────────────────────────────────────────────────
     agg = g.agg(
         races_entered          = ("raceId",            "count"),
-        races_classified       = ("finish_position",   "count"),  # non-null = classified
+        races_classified       = ("finish_position",   "count"),
     ).reset_index()
 
     # ── Finish position stats (classified finishers only) ───────────────────
@@ -702,16 +714,18 @@ def build_driver_season_features(
     agg = agg.merge(pace_agg, on=["driverId", "race_year"], how="left")
 
     # ── Pit stops (exclude incomplete-data races) ────────────────────────────
+    # Column renamed to season_avg_pit_duration_ms to distinguish from the
+    # race-level avg_pit_duration_ms which is a post-race feature.
     pit_df = df[df["pit_data_incomplete"] != 1]
     if len(pit_df) > 0:
         pit_agg_season = pit_df.groupby(["driverId", "race_year"]).agg(
-            avg_pit_stop_count  = ("pit_stop_count",    "mean"),
-            avg_pit_duration_ms = ("avg_pit_duration_ms","mean"),
+            avg_pit_stop_count          = ("pit_stop_count",    "mean"),
+            season_avg_pit_duration_ms  = ("avg_pit_duration_ms","mean"),  # ← renamed
         ).reset_index()
         agg = agg.merge(pit_agg_season, on=["driverId", "race_year"], how="left")
     else:
-        agg["avg_pit_stop_count"]   = np.nan
-        agg["avg_pit_duration_ms"]  = np.nan
+        agg["avg_pit_stop_count"]          = np.nan
+        agg["season_avg_pit_duration_ms"]  = np.nan  # ← renamed
 
     log.info("  driver_season_features: %d rows x %d cols", *agg.shape)
     return agg
@@ -728,23 +742,23 @@ def build_constructor_season_features(
     """
     Build constructor_season_features.parquet — one row per constructor per season.
 
-    Includes driver performance spread metrics: the gap between the team's
-    two drivers across avg finish position, points, and DNF rate, giving a
-    signal for intra-team competitiveness vs. car dominance.
+    When used as model features, join season N-1 stats onto season N races.
+
+    Note on naming: pit duration is stored as `season_avg_pit_duration_ms`
+    (not `avg_pit_duration_ms`) to avoid a name collision with POST_RACE_FEATURES
+    in validate_data.py. See build_driver_season_features() for full rationale.
 
     Columns produced
     ----------------
     Keys           : constructorId, race_year
-    Volume         : races_entered, driver_count (distinct drivers used)
+    Volume         : races_entered, driver_count
     Results        : avg_finish_position, best_finish, finish_std_dev
     Points         : total_points, points_per_race, avg_driver_points
     Flags          : total_wins, total_podiums, total_dnfs
                      win_rate, podium_rate, dnf_rate
-    Pit            : avg_pit_stop_count, avg_pit_duration_ms (clean races only)
-    Driver spread  : driver_spread_avg_finish   (max − min avg finish pos)
-                     driver_spread_total_points (max − min total points)
-                     driver_spread_dnf_rate     (max − min DNF rate)
-                     top_driver_driverId        (driver with most points this season)
+    Pit            : avg_pit_stop_count, season_avg_pit_duration_ms  ← renamed
+    Driver spread  : driver_spread_avg_finish, driver_spread_total_points
+                     driver_spread_dnf_rate, top_driver_driverId
     """
     log.info("Building constructor_season_features ...")
 
@@ -790,19 +804,19 @@ def build_constructor_season_features(
     agg["dnf_rate"]    = agg["total_dnfs"]    / agg["races_entered"]
 
     # ── Pit stops (clean races only) ──────────────────────────────────────────
+    # Column renamed to season_avg_pit_duration_ms — see docstring.
     pit_df = df[df["pit_data_incomplete"] != 1]
     if len(pit_df) > 0:
         pit_agg = pit_df.groupby(["constructorId", "race_year"]).agg(
-            avg_pit_stop_count  = ("pit_stop_count",     "mean"),
-            avg_pit_duration_ms = ("avg_pit_duration_ms","mean"),
+            avg_pit_stop_count         = ("pit_stop_count",     "mean"),
+            season_avg_pit_duration_ms = ("avg_pit_duration_ms","mean"),  # ← renamed
         ).reset_index()
         agg = agg.merge(pit_agg, on=["constructorId", "race_year"], how="left")
     else:
-        agg["avg_pit_stop_count"]   = np.nan
-        agg["avg_pit_duration_ms"]  = np.nan
+        agg["avg_pit_stop_count"]          = np.nan
+        agg["season_avg_pit_duration_ms"]  = np.nan  # ← renamed
 
     # ── Driver performance spread ─────────────────────────────────────────────
-    # Compute per-driver per-season summaries, then diff within each constructor
     driver_season = (
         df.groupby(["constructorId", "race_year", "driverId"])
         .agg(
@@ -814,12 +828,10 @@ def build_constructor_season_features(
     )
 
     def _spread(series: pd.Series) -> float:
-        """max − min across drivers; NaN if fewer than 2 drivers have valid data."""
         valid = series.dropna()
         return float(valid.max() - valid.min()) if len(valid) >= 2 else np.nan
 
     def _top_driver(sub: pd.DataFrame) -> float:
-        """driverId of the driver with the most points this season."""
         if sub.empty:
             return np.nan
         return float(sub.loc[sub["drv_points"].idxmax(), "driverId"])
@@ -841,6 +853,177 @@ def build_constructor_season_features(
 
     log.info("  constructor_season_features: %d rows x %d cols", *agg.shape)
     return agg
+
+
+# ---------------------------------------------------------------------------
+# 2.4  Driver–Race rolling features  (NEW)
+# ---------------------------------------------------------------------------
+
+def build_driver_race_rolling_features(
+    driver_race_df: pd.DataFrame | None = None,
+    db_path: Path = DB_FILE,
+) -> pd.DataFrame:
+    """
+    Build driver_race_rolling.parquet — one row per driver per race.
+
+    Contains cumulative within-season stats up to BUT NOT INCLUDING the
+    current race. For race N in a season, only rounds 1..N-1 contribute.
+    This is the primary in-season signal for the model.
+
+    Technique: sort by (driverId, race_year, round), then for each
+    driverId × race_year group compute expanding window aggregates and
+    shift(1) so race N sees only races 1..N-1. Round 1 of each season
+    will always be NaN (no prior races in that season yet).
+
+    Columns produced
+    ----------------
+    Keys                         : raceId, driverId, constructorId, race_year, round
+    Points                       : rolling_cumulative_points
+    Podiums / wins               : rolling_cumulative_podiums
+                                   rolling_cumulative_wins
+    DNF rate                     : rolling_dnf_rate
+    Avg finish position          : rolling_avg_finish_position
+    Avg qualifying position      : rolling_avg_qualifying_position
+    Races seen so far (N-1)      : rolling_races_counted
+    """
+    log.info("Building driver_race_rolling_features ...")
+
+    if driver_race_df is None:
+        log.info("  driver_race_df not supplied — loading from DB.")
+        driver_race_df = build_driver_race_features(db_path)
+
+    df = (
+        driver_race_df
+        [["raceId", "driverId", "constructorId", "race_year", "round",
+          "points", "is_podium", "is_winner", "is_dnf",
+          "finish_position", "qualifying_position"]]
+        .copy()
+    )
+
+    # Ensure correct sort order for cumulative logic
+    df = df.sort_values(["driverId", "race_year", "round"]).reset_index(drop=True)
+
+    def _rolling(grp: pd.DataFrame) -> pd.DataFrame:
+        """
+        For a single (driverId, race_year) group compute expanding stats
+        then shift by 1 so each row only sees prior races.
+        """
+        out = pd.DataFrame(index=grp.index)
+
+        # Cumulative sum — shift(1) means race N sees sum of races 1..N-1
+        out["rolling_cumulative_points"]  = grp["points"].cumsum().shift(1)
+        out["rolling_cumulative_podiums"] = grp["is_podium"].cumsum().shift(1)
+        out["rolling_cumulative_wins"]    = grp["is_winner"].cumsum().shift(1)
+
+        # Expanding mean — shift(1) so race N sees mean of races 1..N-1
+        out["rolling_dnf_rate"]                = grp["is_dnf"].expanding().mean().shift(1)
+        out["rolling_avg_finish_position"]      = grp["finish_position"].expanding().mean().shift(1)
+        out["rolling_avg_qualifying_position"]  = grp["qualifying_position"].expanding().mean().shift(1)
+
+        # How many races have been seen (useful for confidence weighting)
+        out["rolling_races_counted"] = (
+            grp["points"].expanding().count().shift(1).fillna(0).astype(int)
+        )
+
+        return out
+
+    rolled = (
+        df.groupby(["driverId", "race_year"], group_keys=False)
+        .apply(_rolling)
+    )
+
+    result = df[["raceId", "driverId", "constructorId", "race_year", "round"]].join(rolled)
+
+    log.info(
+        "  driver_race_rolling: %d rows x %d cols  "
+        "(round-1 NaN rows: %d — expected for season openers)",
+        len(result),
+        len(result.columns),
+        int(result["rolling_cumulative_points"].isna().sum()),
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 2.5  Constructor–Race rolling features  (NEW)
+# ---------------------------------------------------------------------------
+
+def build_constructor_race_rolling_features(
+    driver_race_df: pd.DataFrame | None = None,
+    db_path: Path = DB_FILE,
+) -> pd.DataFrame:
+    """
+    Build constructor_race_rolling.parquet — one row per constructor per race round.
+
+    Same shift(1) logic as driver rolling features: constructor stats for
+    race N contain only rounds 1..N-1 of the current season.
+
+    Because multiple drivers contribute per round, we first aggregate to
+    constructor × race_year × round level, then compute the expanding
+    window and shift.
+
+    Columns produced
+    ----------------
+    Keys                         : constructorId, race_year, round
+    Points                       : rolling_cumulative_points
+    Podium / win rate            : rolling_podium_rate
+                                   rolling_win_rate
+    DNF rate                     : rolling_dnf_rate
+    Avg finish position          : rolling_avg_finish_position
+    Races seen so far (N-1)      : rolling_races_counted
+    """
+    log.info("Building constructor_race_rolling_features ...")
+
+    if driver_race_df is None:
+        log.info("  driver_race_df not supplied — loading from DB.")
+        driver_race_df = build_driver_race_features(db_path)
+
+    # Aggregate to constructor × race level first (sum/mean across both drivers)
+    round_agg = (
+        driver_race_df
+        .groupby(["constructorId", "race_year", "round"])
+        .agg(
+            round_points        = ("points",          "sum"),
+            round_podium_rate   = ("is_podium",       "mean"),
+            round_win_rate      = ("is_winner",       "mean"),
+            round_dnf_rate      = ("is_dnf",          "mean"),
+            round_avg_finish    = ("finish_position", "mean"),
+        )
+        .reset_index()
+        .sort_values(["constructorId", "race_year", "round"])
+        .reset_index(drop=True)
+    )
+
+    def _rolling_con(grp: pd.DataFrame) -> pd.DataFrame:
+        out = pd.DataFrame(index=grp.index)
+
+        out["rolling_cumulative_points"]   = grp["round_points"].cumsum().shift(1)
+        out["rolling_podium_rate"]         = grp["round_podium_rate"].expanding().mean().shift(1)
+        out["rolling_win_rate"]            = grp["round_win_rate"].expanding().mean().shift(1)
+        out["rolling_dnf_rate"]            = grp["round_dnf_rate"].expanding().mean().shift(1)
+        out["rolling_avg_finish_position"] = grp["round_avg_finish"].expanding().mean().shift(1)
+        out["rolling_races_counted"]       = (
+            grp["round_points"].expanding().count().shift(1).fillna(0).astype(int)
+        )
+
+        return out
+
+    rolled = (
+        round_agg
+        .groupby(["constructorId", "race_year"], group_keys=False)
+        .apply(_rolling_con)
+    )
+
+    result = round_agg[["constructorId", "race_year", "round"]].join(rolled)
+
+    log.info(
+        "  constructor_race_rolling: %d rows x %d cols  "
+        "(round-1 NaN rows: %d — expected for season openers)",
+        len(result),
+        len(result.columns),
+        int(result["rolling_cumulative_points"].isna().sum()),
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -876,7 +1059,13 @@ def run_build_master_table(
       4. Load master_race_table into SQLite
       5. Create analytical views
       6. Verify database and status FK join
-      7. Build and save the three parquet feature stores
+      7. Build and save five parquet feature stores:
+           2.1  driver_race_full
+           2.2  driver_race_pre
+           2.3  driver_season_features
+           2.4  constructor_season_features
+           2.5  driver_race_rolling       ← NEW
+           2.6  constructor_race_rolling  ← NEW
     """
     processed_dir.mkdir(parents=True, exist_ok=True)
 
@@ -902,11 +1091,11 @@ def run_build_master_table(
     log.info("STEP 4  Building parquet feature stores")
     log.info("=" * 55)
 
-    # 2.1 — Driver–Race (built from DB; shared into season builds)
+    # 2.1 — Driver–Race full (built from DB; shared into all downstream builds)
     driver_race_df = build_driver_race_features(db_file)
     _save_parquet(driver_race_df, DRIVER_RACE_FULL_PARQUET, "driver_race_full")
 
-    # Create a pre-race version without post-race features
+    # 2.2 — Driver–Race pre (column subset only — no post-race features)
     post_race_features = [
         "finish_position", "finish_position_order", "positions_gained",
         "points", "is_dnf", "is_podium", "is_winner", "is_points_finish",
@@ -918,24 +1107,32 @@ def run_build_master_table(
     driver_race_pre_df = driver_race_df[pre_race_cols]
     _save_parquet(driver_race_pre_df, DRIVER_RACE_PRE_PARQUET, "driver_race_pre")
 
-    # 2.2 — Driver–Season (derived from driver_race_df — no extra DB read)
+    # 2.3 — Driver–Season (prior-season signal; join season N-1 onto season N races)
     driver_season_df = build_driver_season_features(driver_race_df, db_file)
     _save_parquet(driver_season_df, DRIVER_SEASON_PARQUET, "driver_season_features")
 
-    # 2.3 — Constructor–Season (derived from driver_race_df — no extra DB read)
+    # 2.4 — Constructor–Season (prior-season signal; same join pattern)
     constructor_season_df = build_constructor_season_features(driver_race_df, db_file)
     _save_parquet(constructor_season_df, CONSTRUCTOR_SEASON_PARQUET, "constructor_season_features")
 
+    # 2.5 — Driver–Race rolling (primary in-season signal; shift(1) applied)
+    driver_rolling_df = build_driver_race_rolling_features(driver_race_df)
+    _save_parquet(driver_rolling_df, DRIVER_RACE_ROLLING_PARQUET, "driver_race_rolling")
+
+    # 2.6 — Constructor–Race rolling (primary in-season signal; shift(1) applied)
+    constructor_rolling_df = build_constructor_race_rolling_features(driver_race_df)
+    _save_parquet(constructor_rolling_df, CONSTRUCTOR_RACE_ROLLING_PARQUET, "constructor_race_rolling")
+
     log.info("=" * 55)
     log.info("build_features.py complete.")
-    log.info("  master_race_table.csv          -> %s", master_table_file)
-    log.info("  f1_database.db                 -> %s", db_file)
-    log.info("  driver_race_full.parquet       -> %s", DRIVER_RACE_FULL_PARQUET)
-    log.info("  driver_race_pre.parquet        -> %s", DRIVER_RACE_PRE_PARQUET)
-    log.info("  driver_season_features.parquet -> %s", DRIVER_SEASON_PARQUET)
-    log.info("  constructor_season.parquet     -> %s", CONSTRUCTOR_SEASON_PARQUET)
-    log.info("  SQL schema                     -> %s", SCHEMA_SQL_FILE)
-    log.info("  SQL views                      -> %s", VIEWS_SQL_FILE)
+    log.info("  master_race_table.csv               -> %s", master_table_file)
+    log.info("  f1_database.db                      -> %s", db_file)
+    log.info("  driver_race_full.parquet            -> %s", DRIVER_RACE_FULL_PARQUET)
+    log.info("  driver_race_pre.parquet             -> %s", DRIVER_RACE_PRE_PARQUET)
+    log.info("  driver_season_features.parquet      -> %s", DRIVER_SEASON_PARQUET)
+    log.info("  constructor_season.parquet          -> %s", CONSTRUCTOR_SEASON_PARQUET)
+    log.info("  driver_race_rolling.parquet         -> %s", DRIVER_RACE_ROLLING_PARQUET)
+    log.info("  constructor_race_rolling.parquet    -> %s", CONSTRUCTOR_RACE_ROLLING_PARQUET)
     return master_df
 
 

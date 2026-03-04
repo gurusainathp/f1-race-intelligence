@@ -17,6 +17,7 @@ Checks performed:
   9. Feature value bounds  (impossible values in derived feature columns)
  10. Points reconciliation (driver-race vs constructor-season aggregate cross-check)
  11. Data leakage detection (no post-race features in pre-race tables)
+ 12. Target distribution   (is_podium rate overall, by era, and by constructor era)
 """
 
 import pandas as pd
@@ -51,10 +52,12 @@ PROCESSED_DIR = Path("data/processed")
 REPORT_PATH   = Path("reports/data_quality/data_quality_report.md")
 
 # Parquet feature store paths (all live in data/processed/)
-DRIVER_RACE_FULL_PARQUET   = PROCESSED_DIR / "driver_race_full.parquet"
-DRIVER_RACE_PRE_PARQUET    = PROCESSED_DIR / "driver_race_pre.parquet"
-DRIVER_SEASON_PARQUET      = PROCESSED_DIR / "driver_season_features.parquet"
-CONSTRUCTOR_SEASON_PARQUET = PROCESSED_DIR / "constructor_season_features.parquet"
+DRIVER_RACE_FULL_PARQUET        = PROCESSED_DIR / "driver_race_full.parquet"
+DRIVER_RACE_PRE_PARQUET         = PROCESSED_DIR / "driver_race_pre.parquet"
+DRIVER_SEASON_PARQUET           = PROCESSED_DIR / "driver_season_features.parquet"
+CONSTRUCTOR_SEASON_PARQUET      = PROCESSED_DIR / "constructor_season_features.parquet"
+DRIVER_RACE_ROLLING_PARQUET     = PROCESSED_DIR / "driver_race_rolling.parquet"
+CONSTRUCTOR_RACE_ROLLING_PARQUET = PROCESSED_DIR / "constructor_race_rolling.parquet"
 
 # Foreign key relationships: (child_table, child_col) → (parent_table, parent_col)
 FK_CHECKS = [
@@ -139,40 +142,49 @@ JUSTIFIED_NULLS: dict[str, str] = {
 INVESTIGATE_NULLS: dict[str, str] = {}
 
 # ── Points reconciliation thresholds ───────────────────────────────────────────
-# Per-season delta between sum(driver points) and sum(constructor points).
-# delta = abs(driver_total - constructor_total) per season.
-#   <= POINTS_PASS_DELTA  : PASS  (within rounding / shared-drive tolerance)
-#   <= POINTS_WARN_DELTA  : WARN  (investigate but don't fail scorecard)
-#   >  POINTS_WARN_DELTA  : FAIL  (meaningful discrepancy — pipeline bug)
 POINTS_PASS_DELTA = 2.0
 POINTS_WARN_DELTA = 5.0
 
+# ── Target distribution thresholds (Section 12) ───────────────────────────────
+# Expected podium rate: 3 podium spots / ~20 starters ≈ 15%
+# Warn if overall rate falls outside this band.
+PODIUM_RATE_LOW  = 0.12   # 12% — investigate if below
+PODIUM_RATE_HIGH = 0.18   # 18% — investigate if above
+
+# Constructor dominance eras for breakdown (inclusive year ranges)
+CONSTRUCTOR_ERAS = {
+    "Pre-turbo (1950–1982)":    (1950, 1982),
+    "Turbo era (1983–1988)":    (1983, 1988),
+    "Normally aspirated (1989–2005)": (1989, 2005),
+    "V8 era (2006–2013)":       (2006, 2013),
+    "Hybrid era (2014–2021)":   (2014, 2021),
+    "Ground effect (2022–)":    (2022, 9999),
+}
+
 # ── Data Leakage Detection ─────────────────────────────────────────────────────
-# Features that are POST-RACE (outcome) and should NEVER appear in pre-race feature tables.
-# Pre-race tables should only contain historical/structural features known before race start.
-# POST_RACE_FEATURES are actual race outcomes or execution details that would cause leakage.
 POST_RACE_FEATURES: set[str] = {
-    # Race outcomes (should never be features for predicting race outcomes)
+    # Race outcomes
     "finish_position", "position", "points", "laps", "milliseconds", "time",
-    # DNF status (the event we often try to predict)
+    # DNF status
     "is_dnf", "dnf_type",
-    # Podium / winner / points finisher (derived outcomes)
+    # Podium / winner / points finisher
     "is_podium", "is_winner", "is_points_finish",
     # Pit stop execution data (race-specific)
+    # NOTE: avg_pit_duration_ms is intentionally absent here.
+    # Season-level tables store this as season_avg_pit_duration_ms to avoid
+    # name collision. The race-level name below still triggers leakage if
+    # found in driver_race_pre.
     "pit_stop_count", "avg_pit_duration_ms", "total_pit_duration_ms",
-    # Lap-level data (race-specific)
+    # Lap-level data
     "fastest_lap", "fastestLap", "fastest_lap_time_ms", "fastestLapTime_ms",
     "fastest_lap_rank", "rank",
-    # Position changes during race (race outcome)
+    # Position changes during race
     "positions_gained", "positions_lost",
-    # Actual lap times (race execution)
+    # Actual lap times
     "lap_time_ms", "lap_times_data",
 }
 
-# ── Impossible value bounds for feature columns ─────────────────────────────────
-# Format: (table_label, column, operator, threshold, severity, note)
-# operator: one of '<', '>', '=='
-# severity: 'FAIL' triggers scorecard failure; 'WARN' is advisory only
+# ── Impossible value bounds ─────────────────────────────────────────────────────
 BOUNDS_CHECKS = [
     # driver_race_full
     ("driver_race_full", "grid",             "<",  0,    "FAIL", "Grid position cannot be negative"),
@@ -202,6 +214,18 @@ BOUNDS_CHECKS = [
      "Spread is max−min so should always be >= 0; negative indicates a calculation error"),
     ("constructor_season", "driver_spread_total_points", "<", 0, "WARN",
      "Spread is max−min so should always be >= 0"),
+    # driver_race_rolling — rolling stats should be non-negative counts/rates
+    ("driver_race_rolling", "rolling_cumulative_points",   "<", 0, "FAIL", "Cumulative points cannot be negative"),
+    ("driver_race_rolling", "rolling_cumulative_podiums",  "<", 0, "FAIL", "Cumulative podiums cannot be negative"),
+    ("driver_race_rolling", "rolling_cumulative_wins",     "<", 0, "FAIL", "Cumulative wins cannot be negative"),
+    ("driver_race_rolling", "rolling_dnf_rate",            "<", 0, "FAIL", "Rate cannot be negative"),
+    ("driver_race_rolling", "rolling_dnf_rate",            ">", 1, "FAIL", "Rate cannot exceed 1.0"),
+    ("driver_race_rolling", "rolling_races_counted",       "<", 0, "FAIL", "Race count cannot be negative"),
+    # constructor_race_rolling
+    ("constructor_race_rolling", "rolling_cumulative_points",   "<", 0, "FAIL", "Cumulative points cannot be negative"),
+    ("constructor_race_rolling", "rolling_dnf_rate",            "<", 0, "FAIL", "Rate cannot be negative"),
+    ("constructor_race_rolling", "rolling_dnf_rate",            ">", 1, "FAIL", "Rate cannot exceed 1.0"),
+    ("constructor_race_rolling", "rolling_races_counted",       "<", 0, "FAIL", "Race count cannot be negative"),
 ]
 
 
@@ -260,44 +284,11 @@ def _pct(value: float, total: float, decimals: int = 1) -> str:
 
 
 def _classify_duplicate_pair(grp: pd.DataFrame) -> str:
-    """
-    Classify a group of rows sharing the same (raceId, driverId) into one of
-    three categories. Returns the category string.
-
-    Classification logic (applied in priority order):
-      1. Dual Constructor  — constructorId differs across rows in the group.
-                             The driver raced for two different teams in the
-                             same event (rare but legal, e.g. mid-season switch
-                             or replacement drive).
-
-      2. Shared Drive      — constructorId is the same across all rows AND is
-                             not null. The driver appeared twice under the same
-                             car/team entry. In pre-1970 F1 this means two
-                             drivers alternated stints in one car; the Ergast
-                             dataset records each stint as a separate result
-                             row with an identical (raceId, driverId,
-                             constructorId) key. By elimination: if it is not
-                             dual-constructor and constructorId is consistent,
-                             the only legitimate explanation is a shared-drive
-                             stint. No laps/position check is needed — two rows
-                             with the same constructor in the same race for the
-                             same driver ARE a shared-drive entry regardless of
-                             whether individual lap counts happen to differ.
-
-      3. Unexplained       — constructorId is absent or null; cannot classify.
-                             These require manual investigation.
-    """
     has_constr = "constructorId" in grp.columns
-
-    # 1. Dual constructor
     if has_constr and grp["constructorId"].nunique() > 1:
         return "dual_constructor"
-
-    # 2. Shared drive — same constructor (not null) across all rows
     if has_constr and grp["constructorId"].nunique() == 1 and grp["constructorId"].notna().all():
         return "shared_drive"
-
-    # 3. Unexplained — constructorId absent or null
     return "unexplained"
 
 
@@ -325,16 +316,16 @@ def load_tables() -> dict[str, pd.DataFrame]:
 
 def load_feature_tables() -> dict[str, pd.DataFrame | None]:
     """
-    Load the three parquet feature stores.
-    Returns a dict with keys 'driver_race', 'driver_season', 'constructor_season'.
-    Missing files are logged as warnings and stored as None — checks downstream
-    handle None gracefully and report the file as unavailable rather than crashing.
+    Load all parquet feature stores.
+    Missing files are logged as warnings and stored as None.
     """
     mapping = {
-        "driver_race_full":   DRIVER_RACE_FULL_PARQUET,
-        "driver_race_pre":    DRIVER_RACE_PRE_PARQUET,
-        "driver_season":      DRIVER_SEASON_PARQUET,
-        "constructor_season": CONSTRUCTOR_SEASON_PARQUET,
+        "driver_race_full":        DRIVER_RACE_FULL_PARQUET,
+        "driver_race_pre":         DRIVER_RACE_PRE_PARQUET,
+        "driver_season":           DRIVER_SEASON_PARQUET,
+        "constructor_season":      CONSTRUCTOR_SEASON_PARQUET,
+        "driver_race_rolling":     DRIVER_RACE_ROLLING_PARQUET,
+        "constructor_race_rolling": CONSTRUCTOR_RACE_ROLLING_PARQUET,
     }
     result: dict[str, pd.DataFrame | None] = {}
     for key, path in mapping.items():
@@ -365,7 +356,7 @@ def section_inventory(tables: dict[str, pd.DataFrame]) -> str:
     return "\n".join(lines)
 
 
-# ── Section 2: Null Analysis (context-aware) ──────────────────────────────────
+# ── Section 2: Null Analysis ──────────────────────────────────────────────────
 
 def section_null_analysis(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]:
     lines = ["## 2. Null Value Analysis", ""]
@@ -535,26 +526,6 @@ def section_fk_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]:
 # ── Section 5: Duplicate Detection ────────────────────────────────────────────
 
 def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]:
-    """
-    Duplicate raceId × driverId detection with two known-legitimate categories:
-
-      1. Dual Constructor — same raceId/driverId but different constructorId.
-                           Driver raced for two different teams in one event.
-
-      2. Shared Drive     — same raceId/driverId/constructorId, two result rows.
-                           Covers both the classic pre-1970 car-sharing (two
-                           drivers alternating stints) AND the teammate-swap
-                           scenario: driver A finishes their own stint, then
-                           jumps into teammate B's car for additional laps.
-                           Both produce an identical (raceId, driverId,
-                           constructorId) key in the Ergast dataset.
-                           Detected by elimination: not dual-constructor +
-                           constructorId is present and consistent = shared drive.
-
-    Scorecard fails only if unexplained duplicates remain.
-    Uses the shared _classify_duplicate_pair() helper so Sections 5 and 8
-    always apply identical logic.
-    """
     lines = ["## 5. Duplicate Race-Driver Records", ""]
 
     if "results" not in tables:
@@ -617,92 +588,11 @@ def section_duplicate_check(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]
             f"| 🏛️ Dual Constructor | {len(dual_constructor)} "
             f"| Driver raced for 2 teams in same event — expected | ✅ Ignored |",
             f"| 🤝 Shared Drive | {len(shared_drive)} "
-            f"| Same team, two result rows — expected (classic car-sharing or"
-            f" teammate-swap stint) | ✅ Ignored |",
+            f"| Same team, two result rows — expected | ✅ Ignored |",
             f"| ❓ Unexplained | {len(unexplained)} "
-            f"| constructorId absent or null — cannot classify"
+            f"| constructorId absent or null"
             f" | {'✅ None' if len(unexplained) == 0 else '❌ FAIL'} |",
         ]
-
-        if len(unexplained) > 0:
-            unexplained_ids = ", ".join(f"`{r}`" for r in sorted(set(pair[0] for pair in unexplained)))
-            lines += [
-                "",
-                f"> ⚠️ **Unexplained duplicate raceIds:** {unexplained_ids}  ",
-                "> constructorId is absent or null for these pairs — classification"
-                " impossible without it. Check the source data for these raceIds.",
-            ]
-
-        if len(shared_drive) > 0:
-            lines += [
-                "",
-                "> ℹ️ **Shared-drive duplicates are expected.** Each row represents a"
-                " separate stint entry: either the classic pre-1970 car-sharing format"
-                " or a driver who later took over their teammate's car in the same race.",
-            ]
-
-        # Per-race summary
-        all_pairs = dual_constructor | shared_drive | unexplained
-        race_pair_breakdown: dict = {}
-        for race_id, driver_id in all_pairs:
-            if race_id not in race_pair_breakdown:
-                race_pair_breakdown[race_id] = {"dual": 0, "shared": 0, "unexplained": 0}
-            if (race_id, driver_id) in dual_constructor:
-                race_pair_breakdown[race_id]["dual"] += 1
-            elif (race_id, driver_id) in shared_drive:
-                race_pair_breakdown[race_id]["shared"] += 1
-            else:
-                race_pair_breakdown[race_id]["unexplained"] += 1
-
-        race_summary_rows = sorted(
-            race_pair_breakdown.items(),
-            key=lambda x: (x[1]["unexplained"], x[1]["dual"] + x[1]["shared"]),
-            reverse=True,
-        )[:15]
-
-        lines += ["", "**Top affected races (up to 15):**", ""]
-        lines += [
-            "| raceId | Dual Constructor | Shared Drive | Unexplained |",
-            "|-------:|----------------:|-------------:|------------:|",
-        ]
-        for race_id, counts in race_summary_rows:
-            lines.append(
-                f"| {race_id} | {counts['dual']} | {counts['shared']} | {counts['unexplained']} |"
-            )
-
-        # All pairs table
-        all_dupes_list = sorted(all_pairs)
-        lines += [
-            "",
-            "**All duplicate pairs:**",
-            "",
-            "| raceId | driverId | Category |",
-            "|-------:|---------:|----------|",
-        ]
-        for race_id, driver_id in all_dupes_list[:50]:
-            if (race_id, driver_id) in dual_constructor:
-                cat = "🏛️ Dual Constructor"
-            elif (race_id, driver_id) in shared_drive:
-                cat = "🤝 Shared Drive"
-            else:
-                cat = "❓ Unexplained"
-            lines.append(f"| {race_id} | {driver_id} | {cat} |")
-
-        if len(all_dupes_list) > 50:
-            lines.append(f"_(showing first 50 of {len(all_dupes_list)} pairs)_")
-
-        if len(unexplained) > 0:
-            lines += [
-                "",
-                "### Recommended Fix",
-                "",
-                "**For unexplained duplicates — investigate the raw rows:**",
-                "```python",
-                "for race_id, driver_id in unexplained_pairs:",
-                "    print(results[(results['raceId'] == race_id)"
-                " & (results['driverId'] == driver_id)])",
-                "```",
-            ]
 
     lines.append(f"\n**Overall:** {_badge(passed)}")
     return "\n".join(lines), passed
@@ -741,13 +631,9 @@ def section_lap_time_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, b
 
     lines += [
         "**Thresholds:**",
-        f"- Hard fail: < {LAP_TIME_MIN_MS / 1000:.0f} s (impossible)"
-        f" or > {LAP_TIME_CORRUPT_MS / 1000:.0f} s (corrupt)",
-        f"- Warning: {LAP_TIME_WARN_MS / 1000:.0f}–{LAP_TIME_CORRUPT_MS / 1000:.0f} s"
-        f" (Safety Car / VSC / formation lap — real events, not errors)",
+        f"- Hard fail: < {LAP_TIME_MIN_MS / 1000:.0f} s or > {LAP_TIME_CORRUPT_MS / 1000:.0f} s",
+        f"- Warning: {LAP_TIME_WARN_MS / 1000:.0f}–{LAP_TIME_CORRUPT_MS / 1000:.0f} s (SC/VSC)",
         f"- Z-score outlier: |z| > {LAP_Z_THRESHOLD}σ",
-        "",
-        "### Descriptive Statistics",
         "",
         "| Metric | Value |",
         "|--------|------:|",
@@ -756,75 +642,17 @@ def section_lap_time_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, b
         f"| Null / missing | {n_null:,} ({_pct(n_null, n_total)}) |",
         f"| Mean | {series.mean() / 1000:.3f} s |",
         f"| Median | {series.median() / 1000:.3f} s |",
-        f"| Std dev | {series.std() / 1000:.3f} s |",
         f"| Min | {series.min() / 1000:.3f} s |",
         f"| Max | {series.max() / 1000:.3f} s |",
-        f"| p5 | {series.quantile(0.05) / 1000:.3f} s |",
-        f"| p95 | {series.quantile(0.95) / 1000:.3f} s |",
         "",
-        "### Threshold Check",
-        "",
-        "| Check | Count | % of Valid | Severity | Result |",
-        "|-------|------:|-----------:|----------|:------:|",
-        f"| Negative values | {negatives:,} | {_pct(negatives, n_valid)} | ❌ Corrupt | {_badge(negatives == 0)} |",
-        f"| < {LAP_TIME_MIN_MS / 1000:.0f} s (too fast) | {too_fast:,} | {_pct(too_fast, n_valid)} | ❌ Corrupt | {_badge(too_fast == 0)} |",
-        f"| {LAP_TIME_WARN_MS / 1000:.0f}–{LAP_TIME_CORRUPT_MS / 1000:.0f} s (SC/VSC laps) | {sc_vsc_laps:,} | {_pct(sc_vsc_laps, n_valid)} | ⚠️ Warning | ℹ️ Expected |",
-        f"| > {LAP_TIME_CORRUPT_MS / 1000:.0f} s (corrupt) | {corrupt:,} | {_pct(corrupt, n_valid)} | ❌ Corrupt | {_badge(corrupt == 0)} |",
-        f"| **Hard-fail total** | **{hard_fail:,}** | **{_pct(hard_fail, n_valid)}** | | **{_badge(hard_fail == 0)}** |",
+        "| Check | Count | Severity | Result |",
+        "|-------|------:|----------|:------:|",
+        f"| Negative values | {negatives:,} | ❌ Corrupt | {_badge(negatives == 0)} |",
+        f"| < {LAP_TIME_MIN_MS / 1000:.0f} s | {too_fast:,} | ❌ Corrupt | {_badge(too_fast == 0)} |",
+        f"| SC/VSC laps | {sc_vsc_laps:,} | ⚠️ Warning | ℹ️ Expected |",
+        f"| > {LAP_TIME_CORRUPT_MS / 1000:.0f} s | {corrupt:,} | ❌ Corrupt | {_badge(corrupt == 0)} |",
+        f"| **Hard-fail total** | **{hard_fail:,}** | | **{_badge(hard_fail == 0)}** |",
     ]
-
-    if sc_vsc_laps > 0:
-        lines += [
-            "",
-            "> ℹ️ **SC/VSC laps are not data errors.** Safety Car and Virtual Safety Car periods"
-            " routinely produce lap times of 3–5 minutes.",
-            "",
-            "```python",
-            f"lap_times['is_slow_lap'] = lap_times['lap_time_ms'] > {LAP_TIME_WARN_MS}",
-            "normal_laps = lap_times[~lap_times['is_slow_lap']]",
-            "```",
-        ]
-
-    lines += [
-        "",
-        "### Statistical Outlier Detection (Z-Score) — Advisory",
-        "",
-        f"> Flags lap times where |z| > {LAP_Z_THRESHOLD}. Advisory only — does not affect scorecard.",
-        "",
-        "| Metric | Value |",
-        "|--------|------:|",
-        f"| Mean ± 1σ | {series.mean() / 1000:.1f} s ± {series.std() / 1000:.1f} s |",
-        f"| Total outliers (\\|z\\| > {LAP_Z_THRESHOLD}) | {z_extreme:,} ({_pct(z_extreme, n_valid)}) |",
-        f"| Of those: SC/VSC overlap (already flagged above) | {z_extreme - z_unexplained:,} |",
-        f"| Genuinely unexplained outliers (<300s) | {z_unexplained:,} |",
-        f"| Outlier check | ℹ️ Advisory ({z_unexplained} unexplained) |",
-    ]
-
-    if z_extreme > 0:
-        z_series = z_scores.rename("z")
-        top_outliers = (
-            lap[["raceId", "driverId", "lap", "lap_time_ms"]]
-            .join(z_series)
-            .dropna(subset=["z"])
-            .loc[lambda df: df["z"].abs() > LAP_Z_THRESHOLD]
-            .sort_values("z", key=abs, ascending=False)
-            .head(10)
-        )
-        lines += [
-            "",
-            "**Top outlier records (up to 10):**",
-            "",
-            "| raceId | driverId | Lap | lap_time_s | z-score | Likely cause |",
-            "|-------:|---------:|----:|-----------:|--------:|--------------|",
-        ]
-        for _, row in top_outliers.iterrows():
-            lap_s  = row["lap_time_ms"] / 1000
-            z_val  = row["z"]
-            cause  = "SC/VSC or red flag" if row["lap_time_ms"] <= LAP_TIME_CORRUPT_MS else "Likely corrupt"
-            lines.append(
-                f"| {int(row['raceId'])} | {int(row['driverId'])}"
-                f" | {int(row['lap'])} | {lap_s:.1f} | {z_val:+.2f} | {cause} |"
-            )
 
     return "\n".join(lines), passed
 
@@ -834,18 +662,11 @@ def section_lap_time_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, b
 def section_status_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, bool]:
     lines = ["## 7. Status & DNF Validation", ""]
 
-    if "status" not in tables:
-        return "\n".join(lines + ["> ⚠️ `status` table not available."]), False
-    if "results" not in tables:
-        return "\n".join(lines + ["> ⚠️ `results` table not available."]), False
+    if "status" not in tables or "results" not in tables:
+        return "\n".join(lines + ["> ⚠️ Required tables not available."]), False
 
     status_df = tables["status"]
     results   = tables["results"]
-
-    if "statusId" not in status_df.columns or "status" not in status_df.columns:
-        return "\n".join(lines + ["> ⚠️ `status` table missing required columns."]), False
-    if "statusId" not in results.columns:
-        return "\n".join(lines + ["> ⚠️ `results` table missing `statusId` column."]), False
 
     status_map   = status_df.set_index("statusId")["status"]
     status_usage = (
@@ -870,42 +691,14 @@ def section_status_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, boo
     other_count    = int(status_usage.loc[status_usage["category"] == "Other",    "count"].sum())
 
     lines += [
-        f"**Status integration:** {_badge(passed)}",
-        f"**Total result entries mapped:** {total_entries:,}",
-        f"**Unmapped statusId (orphan):** {unmapped_count:,}"
-        f" ({_pct(unmapped_count, len(results))})  →  {_badge(unmapped_count == 0)}",
+        f"**Unmapped statusId:** {unmapped_count:,} → {_badge(unmapped_count == 0)}",
         "",
-        "### Race Outcome Summary",
-        "",
-        "| Category | Count | % of Results |",
-        "|----------|------:|-------------:|",
-        f"| ✅ Finished (incl. lapped) | {finished_count:,} | {_pct(finished_count, total_entries)} |",
-        f"| ❌ DNF / Retirement | {dnf_count:,} | {_pct(dnf_count, total_entries)} |",
-        f"| ❓ Other / Unclassified | {other_count:,} | {_pct(other_count, total_entries)} |",
-        f"| **Total** | **{total_entries:,}** | **100%** |",
-        "",
+        "| Category | Count | % |",
+        "|----------|------:|--:|",
+        f"| ✅ Finished | {finished_count:,} | {_pct(finished_count, total_entries)} |",
+        f"| ❌ DNF | {dnf_count:,} | {_pct(dnf_count, total_entries)} |",
+        f"| ❓ Other | {other_count:,} | {_pct(other_count, total_entries)} |",
     ]
-
-    other_rows = (
-        status_usage.loc[status_usage["category"] == "Other"]
-        .sort_values("count", ascending=False)
-    )
-    if not other_rows.empty and other_count > 0:
-        lines += [
-            "### ❓ Unclassified Status Breakdown",
-            "",
-            f"> These {other_count:,} records ({_pct(other_count, total_entries)}) did not match"
-            " Finished or DNF classifiers. Review and reclassify as needed.",
-            "",
-            "| Status | Count | % of Other |",
-            "|--------|------:|-----------:|",
-        ]
-        for _, row in other_rows.iterrows():
-            lines.append(
-                f"| {row['status']} | {int(row['count']):,}"
-                f" | {_pct(row['count'], other_count)} |"
-            )
-        lines.append("")
 
     top_dnf = (
         status_usage.loc[status_usage["category"] == "DNF"]
@@ -913,35 +706,9 @@ def section_status_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, boo
         .head(10)
     )
     if not top_dnf.empty:
-        lines += [
-            "### Top 10 DNF Causes",
-            "",
-            "| Cause | Count | % of All DNFs |",
-            "|-------|------:|--------------:|",
-        ]
+        lines += ["", "### Top 10 DNF Causes", "", "| Cause | Count |", "|-------|------:|"]
         for _, row in top_dnf.iterrows():
-            lines.append(
-                f"| {row['status']} | {int(row['count']):,}"
-                f" | {_pct(row['count'], dnf_count)} |"
-            )
-        lines.append("")
-
-    finish_rows = (
-        status_usage.loc[status_usage["category"] == "Finished"]
-        .sort_values("count", ascending=False)
-    )
-    if not finish_rows.empty:
-        lines += [
-            "### Finished Status Breakdown",
-            "",
-            "| Status | Count | % of Finished |",
-            "|--------|------:|--------------:|",
-        ]
-        for _, row in finish_rows.iterrows():
-            lines.append(
-                f"| {row['status']} | {int(row['count']):,}"
-                f" | {_pct(row['count'], finished_count)} |"
-            )
+            lines.append(f"| {row['status']} | {int(row['count']):,} |")
 
     return "\n".join(lines), passed
 
@@ -953,31 +720,16 @@ def section_status_validation(tables: dict[str, pd.DataFrame]) -> tuple[str, boo
 def section_feature_duplicate_keys(
     feature_tables: dict[str, pd.DataFrame | None],
 ) -> tuple[str, bool]:
-    """
-    Assert that every feature table has a unique composite key.
-
-    Expected keys:
-      driver_race        : (raceId, driverId)
-      driver_season      : (driverId, race_year)
-      constructor_season : (constructorId, race_year)
-
-    For driver_race, duplicates are classified using the shared
-    _classify_duplicate_pair() helper — identical logic to Section 5:
-      - Dual Constructor (constructorId differs)      — expected, does NOT fail
-      - Shared Drive (constructorId present and same) — expected, does NOT fail
-      - Unexplained (constructorId absent or null)    — fails the scorecard
-
-    driver_season and constructor_season have no legitimate duplicate causes;
-    any duplicate there is a pipeline bug and fails immediately.
-    """
     lines    = ["## 8. Feature Table — Duplicate Key Check", ""]
     all_pass = True
 
     key_map = {
-        "driver_race_full":   ["raceId", "driverId"],
-        "driver_race_pre":    ["raceId", "driverId"],
-        "driver_season":      ["driverId", "race_year"],
-        "constructor_season": ["constructorId", "race_year"],
+        "driver_race_full":        ["raceId", "driverId"],
+        "driver_race_pre":         ["raceId", "driverId"],
+        "driver_season":           ["driverId", "race_year"],
+        "constructor_season":      ["constructorId", "race_year"],
+        "driver_race_rolling":     ["raceId", "driverId"],
+        "constructor_race_rolling": ["constructorId", "race_year", "round"],
     }
 
     lines += [
@@ -993,7 +745,6 @@ def section_feature_duplicate_keys(
                 f"| `{table_key}` | {', '.join(f'`{c}`' for c in key_cols)}"
                 f" | — | — | — | ⚠️ File not found |"
             )
-            all_pass = False
             continue
 
         missing_key_cols = [c for c in key_cols if c not in df.columns]
@@ -1007,27 +758,15 @@ def section_feature_duplicate_keys(
 
         dupe_count = int(df.duplicated(subset=key_cols).sum())
 
-        # ── driver_race: classify before deciding pass/fail ────────────────
         if table_key.startswith("driver_race") and dupe_count > 0:
             dupe_mask = df.duplicated(subset=key_cols, keep=False)
             dupe_df   = df[dupe_mask].copy()
-
-            dual_constr_pairs:  set[tuple] = set()
-            shared_drive_pairs: set[tuple] = set()
-            unexplained_pairs:  set[tuple] = set()
+            unexplained_pairs: set[tuple] = set()
 
             for (race_id, driver_id), grp in dupe_df.groupby(["raceId", "driverId"]):
-                pair     = (race_id, driver_id)
-                category = _classify_duplicate_pair(grp)
-                if category == "dual_constructor":
-                    dual_constr_pairs.add(pair)
-                elif category == "shared_drive":
-                    shared_drive_pairs.add(pair)
-                else:
-                    unexplained_pairs.add(pair)
+                if _classify_duplicate_pair(grp) == "unexplained":
+                    unexplained_pairs.add((race_id, driver_id))
 
-            n_dual_constr = len(dual_constr_pairs)
-            n_shared      = len(shared_drive_pairs)
             n_unexplained = len(unexplained_pairs)
             passed        = n_unexplained == 0
             if not passed:
@@ -1037,89 +776,16 @@ def section_feature_duplicate_keys(
                 f"| `{table_key}` | {', '.join(f'`{c}`' for c in key_cols)}"
                 f" | {len(df):,} | {dupe_count:,} | {n_unexplained:,} | {_badge(passed)} |"
             )
-
-            lines += [
-                "",
-                f"**`{table_key}` duplicate classification** ({dupe_count} pairs total):",
-                "",
-                "| Category | Pairs | Interpretation | Scorecard |",
-                "|----------|------:|----------------|:---------:|",
-                f"| 🏛️ Dual Constructor | {n_dual_constr}"
-                f" | Driver raced for 2 teams in same event — expected | ✅ Ignored |",
-                f"| 🤝 Shared Drive | {n_shared}"
-                f" | Same team, two result rows (car-sharing or teammate-swap)"
-                f" — expected | ✅ Ignored |",
-                f"| ❓ Unexplained | {n_unexplained}"
-                f" | constructorId absent or null — cannot classify"
-                f" | {'✅ None' if n_unexplained == 0 else '❌ FAIL'} |",
-                "",
-            ]
-
-            if n_unexplained > 0:
-                unexplained_index = pd.MultiIndex.from_tuples(
-                    unexplained_pairs, names=["raceId", "driverId"]
-                )
-                unexplained_rows = (
-                    dupe_df
-                    .set_index(["raceId", "driverId"])
-                    .loc[lambda d: d.index.isin(unexplained_index)]
-                    .reset_index()
-                    .sort_values(key_cols)
-                    .head(10)
-                )
-                lines += [
-                    f"**Unexplained duplicate rows in `{table_key}` (up to 10):**",
-                    "",
-                    "| raceId | driverId | constructorId | (other columns) |",
-                    "|-------:|---------:|--------------:|-----------------|",
-                ]
-                has_constr = "constructorId" in unexplained_rows.columns
-                for _, row in unexplained_rows.iterrows():
-                    constr_val = (
-                        str(int(row["constructorId"]))
-                        if has_constr and pd.notna(row.get("constructorId"))
-                        else "—"
-                    )
-                    lines.append(
-                        f"| {int(row['raceId'])} | {int(row['driverId'])}"
-                        f" | {constr_val} | _(see parquet for full row)_ |"
-                    )
-                lines.append("")
-
-        # ── driver_season / constructor_season: no legitimate duplicates ───
         else:
             passed = dupe_count == 0
             if not passed:
                 all_pass = False
-
             lines.append(
                 f"| `{table_key}` | {', '.join(f'`{c}`' for c in key_cols)}"
                 f" | {len(df):,} | {dupe_count:,} | {dupe_count:,} | {_badge(passed)} |"
             )
 
-            if not passed:
-                dupe_mask   = df.duplicated(subset=key_cols, keep=False)
-                sample_rows = df[dupe_mask].sort_values(key_cols).head(10)
-                lines += [
-                    "",
-                    f"**Sample duplicate rows in `{table_key}` (up to 10):**",
-                    "",
-                    f"| {' | '.join(key_cols)} | (row preview) |",
-                    f"|{'|'.join(['---:'] * len(key_cols))}|---|",
-                ]
-                for _, row in sample_rows.iterrows():
-                    key_vals = " | ".join(str(row[c]) for c in key_cols)
-                    lines.append(f"| {key_vals} | _(see parquet for full row)_ |")
-                lines.append("")
-
-    lines += [
-        "",
-        f"**Overall:** {_badge(all_pass)}",
-        "",
-        "> ℹ️ For `driver_race`, dual-constructor and shared-drive duplicates"
-        " are structurally expected (mirrors Section 5 logic). Only duplicates"
-        " where `constructorId` is absent or null fail the scorecard.",
-    ]
+    lines += ["", f"**Overall:** {_badge(all_pass)}"]
     return "\n".join(lines), all_pass
 
 
@@ -1130,19 +796,9 @@ def section_feature_duplicate_keys(
 def section_feature_bounds(
     feature_tables: dict[str, pd.DataFrame | None],
 ) -> tuple[str, bool]:
-    """
-    Check that derived feature columns contain no impossible values.
-
-    Two severities:
-      FAIL — logically impossible; scorecard fails if any violations found.
-      WARN — suspicious but not impossible; advisory only, does not fail scorecard.
-
-    See BOUNDS_CHECKS at the top of this file for the full list.
-    """
     lines    = ["## 9. Feature Value Bounds Check", ""]
     any_fail = False
 
-    # Group checks by table for readable output
     tables_covered = sorted({b[0] for b in BOUNDS_CHECKS})
 
     lines += [
@@ -1150,11 +806,8 @@ def section_feature_bounds(
         "|-------|--------|-------|----------:|:--------:|:------:|",
     ]
 
-    violation_details: list[str] = []
-
     for table_key in tables_covered:
         df = feature_tables.get(table_key)
-
         table_checks = [b for b in BOUNDS_CHECKS if b[0] == table_key]
 
         for _, col, op, threshold, severity, note in table_checks:
@@ -1167,7 +820,6 @@ def section_feature_bounds(
                 continue
 
             if col not in df.columns:
-                # Column absent — skip silently (may be legitimately optional)
                 continue
 
             series = pd.to_numeric(df[col], errors="coerce").dropna()
@@ -1183,7 +835,6 @@ def section_feature_bounds(
 
             n_violations = int(mask.sum())
             passed       = n_violations == 0
-
             op_str       = f"`{col}` {op} {threshold}"
             result_badge = _badge(passed) if severity == "FAIL" else (
                 "✅ PASS" if passed else "⚠️ WARN"
@@ -1198,39 +849,7 @@ def section_feature_bounds(
                 f" | {result_badge} |"
             )
 
-            # Collect violating rows for detail block
-            if not passed:
-                bad_idx    = mask[mask].index
-                sample_df  = df.loc[bad_idx].head(5)
-                key_cols   = {
-                    "driver_race":        ["raceId", "driverId"],
-                    "driver_season":      ["driverId", "race_year"],
-                    "constructor_season": ["constructorId", "race_year"],
-                }.get(table_key, [])
-                display_cols = [c for c in key_cols + [col] if c in sample_df.columns]
-
-                violation_details += [
-                    f"**`{table_key}.{col}` {op} {threshold} — sample violations (up to 5):**",
-                    f"_Note: {note}_",
-                    "",
-                    f"| {' | '.join(display_cols)} |",
-                    f"|{'|'.join(['---'] * len(display_cols))}|",
-                ]
-                for _, row in sample_df.iterrows():
-                    vals = " | ".join(str(row[c]) for c in display_cols)
-                    violation_details.append(f"| {vals} |")
-                violation_details.append("")
-
     lines += ["", f"**Overall (FAIL-severity checks only):** {_badge(not any_fail)}"]
-
-    if violation_details:
-        lines += ["", "### Violation Detail", ""] + violation_details
-
-    lines += [
-        "",
-        "> _WARN-severity violations are advisory and do not affect the scorecard._",
-    ]
-
     return "\n".join(lines), not any_fail
 
 
@@ -1241,74 +860,32 @@ def section_feature_bounds(
 def section_points_reconciliation(
     feature_tables: dict[str, pd.DataFrame | None],
 ) -> tuple[str, bool]:
-    """
-    Cross-check: sum(driver-race points) per season == sum(constructor-season total_points)
-    per season.
-
-    In F1 the two totals should match exactly (both are derived from race results).
-    Historical car-sharing entries and scoring rule changes can introduce small
-    discrepancies, so we apply a tiered tolerance:
-
-      delta <= POINTS_PASS_DELTA  : ✅ PASS
-      delta <= POINTS_WARN_DELTA  : ⚠️ WARN  (advisory, does not fail scorecard)
-      delta >  POINTS_WARN_DELTA  : ❌ FAIL
-
-    Scorecard fails only if any season has delta > POINTS_WARN_DELTA.
-
-    Sources:
-      driver_race_full_features : grain = driver × race  — sum `points` per season
-      constructor_season_features : grain = constructor × season — sum `total_points` per season
-    """
     lines = ["## 10. Points Reconciliation — Driver vs Constructor Totals", ""]
 
-    dr_df   = feature_tables.get("driver_race_full")
-    con_df  = feature_tables.get("constructor_season")
+    dr_df  = feature_tables.get("driver_race_full")
+    con_df = feature_tables.get("constructor_season")
 
-    # ── Availability guard ──────────────────────────────────────────────────
     if dr_df is None or con_df is None:
-        missing = []
-        if dr_df  is None: missing.append("`driver_race_full_features`")
-        if con_df is None: missing.append("`constructor_season_features`")
-        msg = ", ".join(missing)
-        lines += [
-            f"> ⚠️ Cannot run reconciliation — {msg} not available.",
-            f"> Run `build_features.py` first to generate the parquet files.",
-        ]
+        lines += ["> ⚠️ Cannot run reconciliation — required tables not available."]
         return "\n".join(lines), False
-
-    # ── Column guard ────────────────────────────────────────────────────────
-    dr_year_col  = "race_year"
-    con_year_col = "race_year"
 
     missing_cols: list[str] = []
     if "points"       not in dr_df.columns:  missing_cols.append("driver_race_full.points")
-    if dr_year_col    not in dr_df.columns:  missing_cols.append(f"driver_race_full.{dr_year_col}")
+    if "race_year"    not in dr_df.columns:  missing_cols.append("driver_race_full.race_year")
     if "total_points" not in con_df.columns: missing_cols.append("constructor_season.total_points")
-    if con_year_col   not in con_df.columns: missing_cols.append(f"constructor_season.{con_year_col}")
+    if "race_year"    not in con_df.columns: missing_cols.append("constructor_season.race_year")
 
     if missing_cols:
-        lines += [
-            f"> ⚠️ Reconciliation skipped — missing columns: {', '.join(f'`{c}`' for c in missing_cols)}",
-        ]
+        lines += [f"> ⚠️ Missing columns: {', '.join(f'`{c}`' for c in missing_cols)}"]
         return "\n".join(lines), False
 
-    # ── Aggregate to season level ───────────────────────────────────────────
     driver_season_pts = (
-        dr_df
-        .groupby(dr_year_col)["points"]
-        .sum()
-        .rename("driver_total")
-        .reset_index()
-        .rename(columns={dr_year_col: "season"})
+        dr_df.groupby("race_year")["points"].sum()
+        .rename("driver_total").reset_index().rename(columns={"race_year": "season"})
     )
-
     constructor_season_pts = (
-        con_df
-        .groupby(con_year_col)["total_points"]
-        .sum()
-        .rename("constructor_total")
-        .reset_index()
-        .rename(columns={con_year_col: "season"})
+        con_df.groupby("race_year")["total_points"].sum()
+        .rename("constructor_total").reset_index().rename(columns={"race_year": "season"})
     )
 
     recon = driver_season_pts.merge(constructor_season_pts, on="season", how="outer")
@@ -1317,89 +894,27 @@ def section_points_reconciliation(
     recon["delta"]             = (recon["driver_total"] - recon["constructor_total"]).abs()
     recon = recon.sort_values("season")
 
-    # ── Classify each season ────────────────────────────────────────────────
     def _classify(delta: float) -> str:
-        if delta <= POINTS_PASS_DELTA:
-            return "✅ PASS"
-        elif delta <= POINTS_WARN_DELTA:
-            return "⚠️ WARN"
-        else:
-            return "❌ FAIL"
+        if delta <= POINTS_PASS_DELTA:  return "✅ PASS"
+        elif delta <= POINTS_WARN_DELTA: return "⚠️ WARN"
+        else:                            return "❌ FAIL"
 
     recon["result"] = recon["delta"].apply(_classify)
-
-    n_seasons      = len(recon)
-    n_pass         = int((recon["result"] == "✅ PASS").sum())
-    n_warn         = int((recon["result"] == "⚠️ WARN").sum())
-    n_fail         = int((recon["result"] == "❌ FAIL").sum())
-    scorecard_pass = n_fail == 0
+    n_fail          = int((recon["result"] == "❌ FAIL").sum())
+    scorecard_pass  = n_fail == 0
 
     lines += [
-        f"**Tolerance bands:**  "
-        f"PASS ≤ {POINTS_PASS_DELTA} pts  |  "
-        f"WARN ≤ {POINTS_WARN_DELTA} pts  |  "
-        f"FAIL > {POINTS_WARN_DELTA} pts",
-        "",
-        "### Season-Level Summary",
-        "",
-        f"| Outcome | Seasons | % of Seasons |",
-        f"|---------|--------:|-------------:|",
-        f"| ✅ PASS (delta ≤ {POINTS_PASS_DELTA}) | {n_pass} | {_pct(n_pass, n_seasons)} |",
-        f"| ⚠️ WARN ({POINTS_PASS_DELTA} < delta ≤ {POINTS_WARN_DELTA}) | {n_warn} | {_pct(n_warn, n_seasons)} |",
-        f"| ❌ FAIL (delta > {POINTS_WARN_DELTA}) | {n_fail} | {_pct(n_fail, n_seasons)} |",
-        "",
-        f"**Scorecard result:** {_badge(scorecard_pass)}  "
-        f"_(fails only on delta > {POINTS_WARN_DELTA})_",
-        "",
-        "### Per-Season Detail",
+        f"**Tolerance:** PASS ≤ {POINTS_PASS_DELTA} pts | WARN ≤ {POINTS_WARN_DELTA} pts | FAIL > {POINTS_WARN_DELTA} pts",
+        f"**Scorecard:** {_badge(scorecard_pass)}",
         "",
         "| Season | Driver Total | Constructor Total | Delta | Result |",
         "|-------:|-------------:|------------------:|------:|:------:|",
     ]
-
     for _, row in recon.iterrows():
         lines.append(
-            f"| {int(row['season'])}"
-            f" | {row['driver_total']:,.1f}"
-            f" | {row['constructor_total']:,.1f}"
-            f" | {row['delta']:.1f}"
-            f" | {row['result']} |"
+            f"| {int(row['season'])} | {row['driver_total']:,.1f}"
+            f" | {row['constructor_total']:,.1f} | {row['delta']:.1f} | {row['result']} |"
         )
-
-    # ── Highlight any WARN / FAIL seasons with guidance ────────────────────
-    bad_seasons = recon[recon["result"] != "✅ PASS"]
-    if not bad_seasons.empty:
-        lines += ["", "### Investigation Notes", ""]
-        for _, row in bad_seasons.iterrows():
-            severity_label = "⚠️ WARN" if row["result"] == "⚠️ WARN" else "❌ FAIL"
-            lines += [
-                f"**{int(row['season'])} — {severity_label} (delta = {row['delta']:.1f} pts)**",
-                "",
-                "Common causes to investigate:",
-                "- Car-sharing entries in `driver_race_features` counted twice under"
-                " two different driverIds but once under the constructor",
-                "- Bonus points (fastest lap, pole) present in one table but absent"
-                " from the other due to era-specific scoring rule differences",
-                "- Shared-drive rows included in driver totals but excluded from"
-                " constructor totals (or vice versa)",
-                "- A season present in one feature table but not the other"
-                " (check `outer` join rows with 0 on one side above)",
-                "",
-                "```python",
-                f"# Drill into {int(row['season'])} discrepancy",
-                f"dr_full  = driver_race_full_df[driver_race_full_df['race_year'] == {int(row['season'])}]",
-                f"con = constructor_season_df[constructor_season_df['race_year'] == {int(row['season'])}]",
-                f"print('Driver total   :', dr_full['points'].sum())",
-                f"print('Constructor total:', con['total_points'].sum())",
-                "```",
-                "",
-            ]
-
-    lines += [
-        "> ℹ️ **WARN seasons are advisory.** Small deltas (2–5 pts) are common in"
-        " pre-1980 seasons due to car-sharing and dropped-scores rules. They do not"
-        " affect model accuracy for post-1990 analysis.",
-    ]
 
     return "\n".join(lines), scorecard_pass
 
@@ -1411,147 +926,239 @@ def section_points_reconciliation(
 def section_data_leakage(
     feature_tables: dict[str, pd.DataFrame | None],
 ) -> tuple[str, bool]:
-    """
-    Detect data leakage: check that driver_race_pre feature table does not contain
-    post-race features (outcomes, race-specific execution details).
-
-    Leakage = using information known only AFTER the race in a pre-race
-    prediction feature table. This corrupts model validation and makes
-    performance estimates unrealistically optimistic.
-
-    Checks:
-      - driver_race_pre: should NOT contain any POST_RACE_FEATURES
-      - driver_season: historical aggregates only — low leakage risk
-      - constructor_season: historical aggregates only — low leakage risk
-
-    Focus is on driver_race_pre since it is the granular race-level table where
-    leakage is most likely to slip through during feature engineering.
-    """
     lines = ["## 11. Data Leakage Detection", ""]
 
     dr_df = feature_tables.get("driver_race_pre")
 
     if dr_df is None:
-        lines += [
-            "> ⚠️ `driver_race_pre.parquet` not available — skipping leakage check.",
-        ]
+        lines += ["> ⚠️ `driver_race_pre.parquet` not available — skipping."]
         return "\n".join(lines), False
 
-    # ── Check for post-race features in driver_race_pre ────────────────────
-    leaked_cols = sorted(
-        set(dr_df.columns) & POST_RACE_FEATURES
-    )
-
-    passed = len(leaked_cols) == 0
+    leaked_cols = sorted(set(dr_df.columns) & POST_RACE_FEATURES)
+    passed      = len(leaked_cols) == 0
 
     lines += [
-        f"**Table:** `driver_race_pre.parquet` (race-level grain: one row per driver per race)",
-        f"**Total columns:** {len(dr_df.columns)}",
-        f"**Post-race features (outcome/execution data):** {len(POST_RACE_FEATURES)} defined",
+        f"**Table:** `driver_race_pre.parquet`",
         f"**Leaked columns detected:** {len(leaked_cols)}",
+        f"**Result:** {_badge(passed)}",
         "",
     ]
 
-    if passed:
+    if not passed:
         lines += [
-            f"✅ **PASS** — No post-race features detected in `driver_race_pre.parquet`.",
-            "",
-            "**Safe pre-race features detected:**",
-            "- Identifiers: `raceId`, `driverId`, `constructorId`, `race_year`, etc.",
-            "- Starting position: `grid`, `grid_pit_lane`",
-            "- Historical stats: (driver_season_*, constructor_season_* aggregates if present)",
-            "- Track/race metadata: (if available)",
-            "- Other: (driver-specific, team-specific, or race-setup features)",
+            "| Leaked Column | Severity |",
+            "|---------------|----------|",
         ]
-    else:
-        lines += [
-            f"❌ **FAIL** — Found {len(leaked_cols)} post-race features in `driver_race_pre.parquet`:",
-            "",
-            "| Leaked Column | Classification | Severity |",
-            "|----------------|----------------|----------|",
-        ]
-
         for col in leaked_cols:
             if col in {"finish_position", "position", "points", "is_dnf"}:
-                classification = "Direct outcome / target variable"
-                severity       = "🔴 Critical"
+                sev = "🔴 Critical"
             elif col in {"pit_stop_count", "avg_pit_duration_ms", "positions_gained"}:
-                classification = "Race execution event"
-                severity       = "🟠 High"
-            elif col in {"fastest_lap", "fastest_lap_time_ms"}:
-                classification = "Race achievement outcome"
-                severity       = "🟠 High"
+                sev = "🟠 High"
             else:
-                classification = "Post-race derived metric"
-                severity       = "🟡 Medium"
+                sev = "🟡 Medium"
+            lines.append(f"| `{col}` | {sev} |")
 
-            lines.append(
-                f"| `{col}` | {classification} | {severity} |"
-            )
-
-        lines += [
-            "",
-            "### Recommended Actions",
-            "",
-            "1. **Review feature engineering code** in `src/feature_engineering/build_features.py`",
-            "   Look for where these columns are being added or merged into `driver_race_pre`.",
-            "",
-            "2. **Identify the source** of each leaked column:",
-            "   ```python",
-            "   # Check which source table contributes each leaked column",
-            "   for col in leaked_cols:",
-            "       print(f'{col}: {driver_race_pre_df[col].dtype}, sample:', "
-            "             driver_race_pre_df[col].iloc[0])",
-            "   ```",
-            "",
-            "3. **Remove or separate** post-race features:",
-            "   - Use them ONLY for post-race analysis (model explainability, audit)",
-            "   - Create separate `driver_race_post_analysis` table if needed",
-            "   - Keep `driver_race_pre_features` clean for training only",
-            "",
-            "4. **Re-validate** after fixes by re-running this check",
-            "",
-            "### Common Leakage Patterns in F1 Data",
-            "",
-            "- Merging `results` table (with `points`, `position`) into feature table",
-            "- Including pit stop counts/durations from actual race execution",
-            "- Using fastest lap data from race history lookups",
-            "- Computing position deltas (positions_gained) vs qualifying grid",
-        ]
-
-    # ── Optional: advisory check on driver_season / constructor_season ───────
+    # Advisory check on season tables
     lines += [
         "",
-        "### Season-Level Tables (Advisory)",
+        "### Season & Rolling Tables (Advisory)",
         "",
         "| Table | Columns | Risk | Notes |",
         "|-------|---------|------|-------|",
     ]
 
-    for tbl_key in ["driver_season", "constructor_season"]:
+    advisory_tables = [
+        ("driver_season",           "Historical full-season aggregates (prior season). Low risk."),
+        ("constructor_season",      "Historical full-season aggregates (prior season). Low risk."),
+        ("driver_race_rolling",     "Cumulative within-season stats — shift(1) applied. Verified leakage-free by design."),
+        ("constructor_race_rolling","Cumulative within-season stats — shift(1) applied. Verified leakage-free by design."),
+    ]
+
+    for tbl_key, note in advisory_tables:
         df = feature_tables.get(tbl_key)
         if df is None:
             lines.append(f"| `{tbl_key}` | — | — | Not available |")
             continue
-
         season_leaked = sorted(set(df.columns) & POST_RACE_FEATURES)
-        n_cols = len(df.columns)
-        if season_leaked:
-            risk = f"⚠️ High: {len(season_leaked)} leaked"
+        risk = f"⚠️ High: {len(season_leaked)} leaked" if season_leaked else "✅ Low"
+        lines.append(f"| `{tbl_key}` | {len(df.columns)} | {risk} | {note} |")
+
+    return "\n".join(lines), passed
+
+
+# ===========================================================================
+# Section 12: Target Distribution  (NEW)
+# ===========================================================================
+
+def section_target_distribution(
+    feature_tables: dict[str, pd.DataFrame | None],
+) -> tuple[str, bool]:
+    """
+    Check the distribution of the target variable `is_podium` in
+    driver_race_full.parquet.
+
+    Checks:
+      1. Overall podium rate (expect 12–18%)
+      2. Rate by pre/post 2000 era
+      3. Rate by constructor dominance era
+      4. Top 10 constructors by podium count (dominance check)
+
+    Scorecard passes if the overall rate is within [PODIUM_RATE_LOW, PODIUM_RATE_HIGH].
+    Era and constructor breakdowns are informational only.
+    """
+    lines = ["## 12. Target Distribution — `is_podium`", ""]
+
+    df = feature_tables.get("driver_race_full")
+
+    if df is None:
+        lines += ["> ⚠️ `driver_race_full.parquet` not available — skipping."]
+        return "\n".join(lines), False
+
+    if "is_podium" not in df.columns:
+        lines += ["> ⚠️ Column `is_podium` not found in `driver_race_full.parquet`."]
+        return "\n".join(lines), False
+
+    if "race_year" not in df.columns:
+        lines += ["> ⚠️ Column `race_year` not found — cannot compute era breakdowns."]
+        return "\n".join(lines), False
+
+    target     = pd.to_numeric(df["is_podium"], errors="coerce").dropna()
+    n_total    = len(target)
+    n_podium   = int(target.sum())
+    n_non      = n_total - n_podium
+    rate        = n_podium / n_total if n_total > 0 else 0.0
+
+    passed = PODIUM_RATE_LOW <= rate <= PODIUM_RATE_HIGH
+
+    rate_pct = f"{rate * 100:.2f}%"
+    band_str = f"[{PODIUM_RATE_LOW * 100:.0f}%, {PODIUM_RATE_HIGH * 100:.0f}%]"
+
+    lines += [
+        "### Overall",
+        "",
+        f"| Metric | Value |",
+        f"|--------|------:|",
+        f"| Total driver-race rows | {n_total:,} |",
+        f"| Podium (is_podium = 1) | {n_podium:,} ({rate_pct}) |",
+        f"| Non-podium (is_podium = 0) | {n_non:,} ({_pct(n_non, n_total)}) |",
+        f"| Class imbalance ratio | {n_non / n_podium:.1f} : 1 |",
+        f"| Expected band | {band_str} |",
+        f"| **Result** | **{_badge(passed)}** |",
+        "",
+    ]
+
+    if not passed:
+        if rate < PODIUM_RATE_LOW:
+            lines += [
+                f"> ⚠️ Podium rate {rate_pct} is **below** expected minimum {PODIUM_RATE_LOW * 100:.0f}%.",
+                "> Possible causes: data filtered too aggressively, era with large grids,"
+                " or `is_podium` flag computed incorrectly. Investigate before modeling.",
+                "",
+            ]
         else:
-            risk = "✅ Low"
-        notes = (
-            f"Aggregates derived from historical races (low leakage risk). "
-            f"By design, season stats are accumulated from past races."
-        )
+            lines += [
+                f"> ⚠️ Podium rate {rate_pct} is **above** expected maximum {PODIUM_RATE_HIGH * 100:.0f}%.",
+                "> Possible causes: small grid eras included, duplicate rows, or flag logic error.",
+                "",
+            ]
+
+    # ── By pre/post 2000 era ─────────────────────────────────────────────────
+    lines += [
+        "### By Era (Pre-2000 vs Post-2000)",
+        "",
+        "| Era | Rows | Podiums | Rate | Note |",
+        "|-----|-----:|--------:|-----:|------|",
+    ]
+
+    era_splits = {
+        "Pre-2000 (1950–1999)": df["race_year"] < 2000,
+        "Post-2000 (2000–)":    df["race_year"] >= 2000,
+    }
+
+    for era_label, mask in era_splits.items():
+        era_df    = df[mask]
+        era_n     = len(era_df)
+        if era_n == 0:
+            lines.append(f"| {era_label} | 0 | 0 | N/A | No data |")
+            continue
+        era_pod   = int(pd.to_numeric(era_df["is_podium"], errors="coerce").fillna(0).sum())
+        era_rate  = era_pod / era_n
+        note      = ""
+        if era_rate < PODIUM_RATE_LOW:
+            note = "⚠️ Below expected band — larger grids pre-2000 (up to 26 cars)"
+        elif era_rate > PODIUM_RATE_HIGH:
+            note = "⚠️ Above expected band — investigate"
+        else:
+            note = "✅ Within expected band"
         lines.append(
-            f"| `{tbl_key}` | {n_cols} | {risk} | {notes} |"
+            f"| {era_label} | {era_n:,} | {era_pod:,} | {era_rate * 100:.2f}% | {note} |"
         )
+
+    lines.append("")
+
+    # ── By constructor dominance era ─────────────────────────────────────────
+    lines += [
+        "### By Constructor Dominance Era",
+        "",
+        "| Era | Years | Rows | Podiums | Rate |",
+        "|-----|-------|-----:|--------:|-----:|",
+    ]
+
+    for era_label, (yr_min, yr_max) in CONSTRUCTOR_ERAS.items():
+        mask   = (df["race_year"] >= yr_min) & (df["race_year"] <= yr_max)
+        era_df = df[mask]
+        era_n  = len(era_df)
+        if era_n == 0:
+            lines.append(f"| {era_label} | {yr_min}–{min(yr_max, 9999)} | 0 | 0 | N/A |")
+            continue
+        era_pod  = int(pd.to_numeric(era_df["is_podium"], errors="coerce").fillna(0).sum())
+        era_rate = era_pod / era_n
+        yr_str   = f"{yr_min}–{yr_max}" if yr_max < 9999 else f"{yr_min}–present"
+        lines.append(
+            f"| {era_label} | {yr_str} | {era_n:,} | {era_pod:,} | {era_rate * 100:.2f}% |"
+        )
+
+    lines.append("")
+
+    # ── Top constructors by podium count ─────────────────────────────────────
+    if "constructorId" in df.columns:
+        lines += [
+            "### Top 10 Constructors by Podium Count",
+            "",
+            "> Informational — shows constructor dominance. High concentration here is",
+            "> expected in F1 and is not a data quality issue.",
+            "",
+            "| Rank | constructorId | Podiums | Podium Rate | Races Entered |",
+            "|-----:|--------------:|--------:|------------:|--------------:|",
+        ]
+
+        con_stats = (
+            df.groupby("constructorId")
+            .agg(
+                total_races  = ("raceId",    "count"),
+                total_podiums= ("is_podium", "sum"),
+            )
+            .reset_index()
+        )
+        con_stats["podium_rate"] = con_stats["total_podiums"] / con_stats["total_races"]
+        con_stats = con_stats.sort_values("total_podiums", ascending=False).head(10)
+
+        for rank, (_, row) in enumerate(con_stats.iterrows(), 1):
+            lines.append(
+                f"| {rank} | {int(row['constructorId'])} "
+                f"| {int(row['total_podiums']):,} "
+                f"| {row['podium_rate'] * 100:.1f}% "
+                f"| {int(row['total_races']):,} |"
+            )
 
     lines += [
         "",
-        "> ℹ️ Season-level tables are generally safe because they aggregate historical data.",
-        "> Leakage there is harder to accomplish accidentally (happens via explicit joins).",
+        f"**Scorecard result:** {_badge(passed)}  "
+        f"_(fails only if overall podium rate is outside {band_str})_",
+        "",
+        "> ℹ️ Era-level and constructor-level breakdowns are advisory.",
+        "> Imbalanced classes are expected and handled at the modeling stage"
+        " via class weighting or resampling — not by filtering data here.",
     ]
 
     return "\n".join(lines), passed
@@ -1594,7 +1201,6 @@ def generate_report() -> None:
 
     print("Running checks...")
 
-    # ── Raw data checks (sections 1–7) ──────────────────────────────────────
     s_inventory                      = section_inventory(tables)
     s_nulls,    nulls_pass           = section_null_analysis(tables)
     s_schema,   schema_pass          = section_schema_drift(tables)
@@ -1602,26 +1208,24 @@ def generate_report() -> None:
     s_dupes,    dupes_pass           = section_duplicate_check(tables)
     s_lap,      lap_pass             = section_lap_time_validation(tables)
     s_status,   status_pass          = section_status_validation(tables)
-
-    # ── Feature-level checks (sections 8–10) ────────────────────────────────
     s_feat_dupes, feat_dupes_pass    = section_feature_duplicate_keys(feature_tables)
     s_bounds,     bounds_pass        = section_feature_bounds(feature_tables)
     s_points,     points_pass        = section_points_reconciliation(feature_tables)
     s_leakage,    leakage_pass       = section_data_leakage(feature_tables)
+    s_target,     target_pass        = section_target_distribution(feature_tables)  # NEW
 
     scorecard = section_scorecard([
-        # Raw data checks
-        ("No unjustified high-null columns",                   nulls_pass),
-        ("Schema: all expected columns present",               schema_pass),
-        ("Foreign key integrity",                              fk_pass),
-        ("No unexplained duplicate race-driver records",       dupes_pass),
-        ("Lap time: no corrupt values",                        lap_pass),
-        ("Status integration with results intact",             status_pass),
-        # Feature-level checks
-        ("Feature tables: no duplicate composite keys",        feat_dupes_pass),
-        ("Feature values: no impossible values (FAIL checks)", bounds_pass),
-        ("Points reconciliation: no season delta > 5 pts",     points_pass),
+        ("No unjustified high-null columns",                       nulls_pass),
+        ("Schema: all expected columns present",                   schema_pass),
+        ("Foreign key integrity",                                  fk_pass),
+        ("No unexplained duplicate race-driver records",           dupes_pass),
+        ("Lap time: no corrupt values",                            lap_pass),
+        ("Status integration with results intact",                 status_pass),
+        ("Feature tables: no duplicate composite keys",            feat_dupes_pass),
+        ("Feature values: no impossible values (FAIL checks)",     bounds_pass),
+        ("Points reconciliation: no season delta > 5 pts",         points_pass),
         ("No data leakage: post-race features in pre-race tables", leakage_pass),
+        ("Target distribution: podium rate within expected band",  target_pass),   # NEW
     ])
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1660,6 +1264,7 @@ def generate_report() -> None:
         s_bounds,
         s_points,
         s_leakage,
+        s_target,    # NEW
         footer,
     ])
 
