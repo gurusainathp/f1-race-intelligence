@@ -31,8 +31,8 @@ Null-fill rules
   Rolling features (round 1 of season — no prior races yet):
     rolling_podium_rate, rolling_dnf_rate, rolling_avg_finish_position,
     rolling_avg_qualifying_position → fill NaN with 0
-    rolling_cumulative_points, rolling_cumulative_podiums → fill NaN with 0
-    rolling_races_counted → fill NaN with 0
+    rolling_cumulative_points → fill NaN with 0
+    # rolling_cumulative_podiums is dropped (rate is kept via rolling_podium_rate)
 
   Prior season features (rookies or first season >= 2000):
     prev_season_points       → fill NaN with 0
@@ -40,6 +40,16 @@ Null-fill rules
     has_prev_season          → 0 if no prior season data, else 1
 
   Constructor rolling follows the same round-1 fill logic.
+
+  Median imputation (sparse cols — global median):
+    qualifying_gap_ms, best_quali_ms, con_rolling_win_rate
+
+Dropped columns (redundant / structural)
+-----------------------------------------
+  grid               — replaced by grid_imputed (no nulls, pit-lane safe)
+  qualifying_position — same ordering signal as grid_imputed; gap_ms kept for pace
+  rolling_races_counted, con_rolling_races_counted — correlate ~0.95 with round
+  constructorId_drv_roll, race_year_drv_roll, round_drv_roll — join suffix artefacts
 
 Deduplication
 -------------
@@ -98,6 +108,7 @@ YEAR_CUTOFF = 2000   # race_year >= YEAR_CUTOFF
 # Columns that must NOT appear in the final modeling dataset.
 # Hard-coded so the validator can cross-check against the same list.
 FORBIDDEN_COLUMNS: set[str] = {
+    # ── Post-race outcomes (direct leakage) ──────────────────────────────────
     "finish_position",
     "finish_position_order",
     "positionOrder",
@@ -119,24 +130,46 @@ FORBIDDEN_COLUMNS: set[str] = {
     "points",
     "laps",
     "statusId",
-    # Rolling wins kept only as part of cumulative_podiums; explicit wins col removed
     "rolling_cumulative_wins",
+    # rolling_cumulative_podiums — rate (rolling_podium_rate) is kept;
+    # the raw count adds multicollinearity with cumulative_points
+    "rolling_cumulative_podiums",
+    # ── Redundant grid column — grid_imputed is the cleaned version ──────────
+    # grid has nulls for pit-lane starts; grid_imputed is always filled.
+    # Keeping both adds multicollinearity with no gain.
+    "grid",
+    # ── Redundant qualifying column ──────────────────────────────────────────
+    # qualifying_position carries the same ordering signal as grid_imputed.
+    # qualifying_gap_ms is kept — it provides pace signal independent of position.
+    "qualifying_position",
+    # ── Rolling race count columns — dataset mechanics, not features ─────────
+    # rolling_races_counted and con_rolling_races_counted correlate ~0.95
+    # with round number, which is already in the dataset. No predictive gain.
+    "rolling_races_counted",
+    "con_rolling_races_counted",
+    # ── Structural suffix columns from the rolling join ──────────────────────
+    # When driver_race_rolling is merged onto driver_race_pre both share
+    # constructorId, race_year, and round. Pandas appends _drv_roll suffix
+    # to the duplicates from the right frame — these must be dropped.
+    "constructorId_drv_roll",
+    "race_year_drv_roll",
+    "round_drv_roll",
 }
 
 # Rolling feature columns that should be filled with 0 when NaN
 # (occurs for round 1 of each season — no prior races yet)
 ROLLING_FILL_ZERO: list[str] = [
     "rolling_cumulative_points",
-    "rolling_cumulative_podiums",
+    # rolling_cumulative_podiums dropped — in FORBIDDEN_COLUMNS
     "rolling_dnf_rate",
     "rolling_avg_finish_position",
     "rolling_avg_qualifying_position",
-    "rolling_races_counted",
+    # rolling_races_counted and con_rolling_races_counted are in FORBIDDEN_COLUMNS
+    # and will be dropped — no need to fill them here.
     "con_rolling_cumulative_points",
     "con_rolling_podium_rate",
     "con_rolling_dnf_rate",
     "con_rolling_avg_finish_position",
-    "con_rolling_races_counted",
 ]
 
 # Prior-season feature columns filled with 0 for rookies
@@ -351,6 +384,28 @@ def build_modeling_dataset() -> pd.DataFrame:
         df["rolling_podium_rate"] = df["rolling_podium_rate"].fillna(0.0)
         if n_filled:
             log.info("    %-40s  filled %d NaNs with 0", "rolling_podium_rate", n_filled)
+
+    # ── Step 7b: Median imputation for sparse qualifying / constructor cols ─────
+    # qualifying_gap_ms, best_quali_ms and con_rolling_win_rate can have moderate
+    # null rates (pit-lane starts, penalties, round-1 no prior wins).
+    # Fill with global median so the model sees a sensible central value rather
+    # than NaN, which tree-based and linear models handle differently.
+    log.info("Step 7b — Median-filling qualifying and constructor sparse cols ...")
+    MEDIAN_FILL_COLS: list[str] = [
+        "qualifying_gap_ms",
+        "best_quali_ms",
+        "con_rolling_win_rate",
+    ]
+    for col in MEDIAN_FILL_COLS:
+        if col in df.columns:
+            n_null  = int(df[col].isna().sum())
+            med_val = df[col].median()
+            df[col] = df[col].fillna(med_val)
+            if n_null:
+                log.info(
+                    "    %-40s  filled %d NaNs with global median %.4f",
+                    col, n_null, med_val,
+                )
 
     # ── Step 8: Drop forbidden columns ──────────────────────────────────────
     log.info("Step 8 — Dropping forbidden post-race / redundant columns ...")

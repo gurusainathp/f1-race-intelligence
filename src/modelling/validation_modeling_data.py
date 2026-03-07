@@ -13,12 +13,17 @@ Checks performed:
   5. Correlation audit        — Pearson matrix; flags |r| > 0.90 pairs
 
 Null rules used in check 4:
-  - grid                          → 0 nulls expected
+  - grid                          → null JUSTIFIED when grid_pit_lane == 1 (pit-lane starts);
+                                    FAIL only if null where grid_pit_lane == 0
+  - grid_imputed                  → 0 nulls expected (model-safe imputed version)
   - is_podium                     → 0 nulls expected (target)
-  - rolling_* where round == 1    → NaN allowed (filled with 0 in build step)
-  - rolling_* where round >  1    → 0 nulls expected
+  - rolling_* cumulative/rate     → 0 nulls expected (build fills round-1 NaNs with 0)
+  - rolling_avg_*_position        → advisory only (justified nulls from DNFs/pit-lane starts)
   - prev_season_* / has_prev_season → 0 nulls expected (filled with 0 for rookies)
-  - constructor rolling cols      → same round-1 rule as driver rolling
+  - constructor rolling cols      → same rules as driver rolling above
+  - qualifying_position           → advisory (null for pit-lane starts, penalties, early era)
+  - qualifying_gap_ms / best_quali_ms → advisory (null when qualifying_position is null)
+  - pit_data_incomplete           → 0 nulls expected (always 0 or 1 by construction)
 
 Note: this script does NOT auto-fix anything.
 It reports problems and exits with code 1 if any FAIL-level check fails,
@@ -66,6 +71,11 @@ except ImportError:
         "is_dnf", "dnf_type", "is_winner", "is_points_finish",
         "points", "laps", "statusId",
         "rolling_cumulative_wins",
+        "rolling_cumulative_podiums",
+        # Redundant / structural columns dropped by build script
+        "grid", "qualifying_position",
+        "rolling_races_counted", "con_rolling_races_counted",
+        "constructorId_drv_roll", "race_year_drv_roll", "round_drv_roll",
     }
 
 # ---------------------------------------------------------------------------
@@ -74,22 +84,25 @@ except ImportError:
 REQUIRED_COLUMNS: list[str] = [
     # Identifiers
     "raceId", "driverId", "constructorId", "race_year", "round", "circuitId",
-    # Race setup — grid is nullable (pit-lane starts); grid_imputed is always filled
-    "grid", "grid_pit_lane", "grid_imputed",
-    # Driver rolling
+    # Race setup — grid_imputed replaces grid (nulls filled, pit-lane safe)
+    "grid_imputed", "grid_pit_lane",
+    # Qualifying — qualifying_position dropped (same signal as grid_imputed)
+    "qualifying_gap_ms", "best_quali_ms",
+    # Pit metadata flag
+    "pit_data_incomplete",
+    # Driver rolling — rolling_races_counted dropped (correlates ~0.95 with round)
     "rolling_cumulative_points",
-    "rolling_cumulative_podiums",
+    # rolling_cumulative_podiums dropped — rate kept via rolling_podium_rate
     "rolling_podium_rate",
     "rolling_dnf_rate",
     "rolling_avg_finish_position",
     "rolling_avg_qualifying_position",
-    "rolling_races_counted",
-    # Constructor rolling
+    # Constructor rolling — con_rolling_races_counted dropped (same reason)
     "con_rolling_cumulative_points",
     "con_rolling_podium_rate",
+    "con_rolling_win_rate",
     "con_rolling_dnf_rate",
     "con_rolling_avg_finish_position",
-    "con_rolling_races_counted",
     # Prior season
     "prev_season_points",
     "prev_season_podium_rate",
@@ -101,15 +114,21 @@ REQUIRED_COLUMNS: list[str] = [
 # Columns that must have zero nulls regardless of any context
 # NOTE: grid is intentionally absent — it is NULL for pit-lane starts by design.
 #       grid_imputed is the model-safe version and must be 0 nulls.
+#       qualifying_* cols are absent — they are advisory (nulls from pit-lane/penalties).
 ZERO_NULL_ALWAYS: list[str] = [
     "raceId", "driverId", "constructorId",
     "race_year", "round", "circuitId",
     "grid_pit_lane",
-    "grid_imputed",       # imputed version — always filled
+    "grid_imputed",            # replaces raw grid — always filled post-imputation
+    "pit_data_incomplete",     # always 0 or 1 by construction
     "is_podium",
     "has_prev_season",
     "prev_season_points",
     "prev_season_podium_rate",
+    # Median-filled by build script Step 7b — must be 0 nulls in final dataset
+    "qualifying_gap_ms",
+    "best_quali_ms",
+    "con_rolling_win_rate",
 ]
 
 # Rolling columns where 0 nulls are required post-build
@@ -122,14 +141,15 @@ ZERO_NULL_ALWAYS: list[str] = [
 # These three are validated as ADVISORY only (see section_null_audit).
 ROLLING_COLS: list[str] = [
     "rolling_cumulative_points",
-    "rolling_cumulative_podiums",
+    # rolling_cumulative_podiums dropped — rate kept via rolling_podium_rate
     "rolling_podium_rate",
     "rolling_dnf_rate",
-    "rolling_races_counted",
+    # rolling_races_counted dropped (correlates ~0.95 with round)
     "con_rolling_cumulative_points",
     "con_rolling_podium_rate",
+    "con_rolling_win_rate",
     "con_rolling_dnf_rate",
-    "con_rolling_races_counted",
+    # con_rolling_races_counted dropped (same reason)
 ]
 
 # Rolling position columns validated as advisory (justified nulls beyond round 1)
@@ -384,16 +404,15 @@ def section_null_audit(df: pd.DataFrame) -> tuple[str, bool]:
             lines.append(f"| `{col}` | {n_null:,} | {pct_str} | {rule} | {result} |")
             continue
 
-        # ── qualifying_position: contextual advisory ───────────────────────
-        if col == "qualifying_position":
-            rule = "Advisory — null for pit-lane starts, penalties, early era"
-            if n_null == 0:
-                result = "✅ Clean"
-            elif null_pct < 10:
-                result = "ℹ️ Minor (expected)"
-            else:
-                result = f"⚠️ {pct_str} — investigate if > 10%"
-            lines.append(f"| `{col}` | {n_null:,} | {pct_str} | {rule} | {result} |")
+        # ── qualifying cols: must be 0 nulls after median fill ────────────
+        # qualifying_gap_ms and best_quali_ms are median-filled by Step 7b.
+        # qualifying_position is dropped from the dataset entirely.
+        if col in {"qualifying_gap_ms", "best_quali_ms"}:
+            rule = "Must be 0 (median-filled by build script)"
+            passed_col = n_null == 0
+            if not passed_col:
+                any_fail = True
+            lines.append(f"| `{col}` | {n_null:,} | {pct_str} | {rule} | {_badge(passed_col)} |")
             continue
 
         # ── everything else: advisory ──────────────────────────────────────
@@ -419,6 +438,7 @@ def section_null_audit(df: pd.DataFrame) -> tuple[str, bool]:
         "| Must be 0 (build fills round-1) | Rolling cols filled by build script — FAIL if any remain |",
         "| Null OK if grid_pit_lane=1 only | Raw grid — null justified only for pit-lane starters |",
         "| Advisory — DNF/pit-lane nulls expected | Position rolling cols — nulls OK, do not fail |",
+        "| Advisory — null for pit-lane starts, penalties, early era | Qualifying cols — nulls OK, do not fail |",
         "| Advisory | Informational only — does not affect scorecard |",
     ]
 
@@ -534,6 +554,112 @@ def section_correlation_audit(df: pd.DataFrame) -> tuple[str, bool]:
 # Scorecard
 # ===========================================================================
 
+
+# ===========================================================================
+# Section 6: VIF — Variance Inflation Factor
+# ===========================================================================
+
+def section_vif(df: pd.DataFrame) -> tuple[str, bool]:
+    """
+    Compute Variance Inflation Factor for all numeric feature columns.
+
+    VIF measures how much the variance of a regression coefficient is inflated
+    due to linear dependence with other features. High VIF indicates
+    multicollinearity, which inflates standard errors in linear models.
+
+    Thresholds:
+      VIF < 5    — ✅ Low (acceptable)
+      VIF 5–10   — ⚠️ Moderate (monitor)
+      VIF > 10   — ❌ High (collinearity concern — review before Logistic Regression)
+
+    Advisory only — does not fail the scorecard.
+    Requires statsmodels; gracefully skips if not installed.
+    """
+    lines = ["## 6. VIF — Variance Inflation Factor", ""]
+
+    # Exclude identifiers, binary flags, and target from VIF
+    exclude = {
+        "raceId", "driverId", "constructorId", "race_year", "round", "circuitId",
+        "is_podium", "has_prev_season", "grid_pit_lane", "pit_data_incomplete",
+    }
+
+    numeric_cols = [
+        c for c in df.columns
+        if c not in exclude and pd.api.types.is_numeric_dtype(df[c])
+    ]
+
+    if len(numeric_cols) < 2:
+        lines += ["> ⚠️ Not enough numeric feature columns for VIF analysis."]
+        return "\n".join(lines), True
+
+    # VIF requires complete cases — drop rows with any null in feature set
+    feature_df = df[numeric_cols].dropna()
+    n_dropped  = len(df) - len(feature_df)
+
+    try:
+        from statsmodels.stats.outliers_influence import variance_inflation_factor
+    except ImportError:
+        lines += [
+            "> ⚠️ `statsmodels` not installed — VIF check skipped.",
+            "> Install with: `pip install statsmodels`",
+        ]
+        return "\n".join(lines), True
+
+    lines += [
+        f"**Features analysed:** {len(numeric_cols)}",
+        f"**Rows used (complete cases):** {len(feature_df):,}"
+        + (f"  _(dropped {n_dropped:,} rows with nulls)_" if n_dropped else ""),
+        "",
+        "| Feature | VIF | Assessment |",
+        "|---------|----:|-----------|",
+    ]
+
+    X = feature_df.values.astype(float)
+    vif_rows: list[tuple[str, float]] = []
+    for i, col in enumerate(numeric_cols):
+        try:
+            v = float(variance_inflation_factor(X, i))
+        except Exception:
+            v = float("nan")
+        vif_rows.append((col, v))
+
+    # Sort descending by VIF (NaN last)
+    vif_rows.sort(
+        key=lambda x: x[1] if not np.isnan(x[1]) else -1,
+        reverse=True,
+    )
+
+    n_high = 0
+    for col, v in vif_rows:
+        if np.isnan(v):
+            assessment = "⚠️ Could not compute"
+            tag = "N/A"
+        elif v > 10:
+            assessment = "❌ High — multicollinearity concern"
+            n_high += 1
+            tag = f"{v:.1f}"
+        elif v >= 5:
+            assessment = "⚠️ Moderate — monitor"
+            tag = f"{v:.1f}"
+        else:
+            assessment = "✅ Low"
+            tag = f"{v:.1f}"
+        lines.append(f"| `{col}` | {tag} | {assessment} |")
+
+    lines += [
+        "",
+        f"**High-VIF features (> 10):** {n_high}",
+        "",
+        "> ℹ️ VIF is advisory — high values do not automatically require dropping a feature.",
+        "> Interpret alongside the correlation audit (Section 5).",
+        "> XGBoost is robust to multicollinearity; Logistic Regression is not.",
+        "> For Logistic Regression: consider dropping or PCA-transforming features",
+        "> with VIF > 10 before fitting.",
+    ]
+
+    return "\n".join(lines), True   # advisory — always passes scorecard
+
+
 def section_scorecard(checks: list[tuple[str, bool]]) -> str:
     all_pass = all(passed for _, passed in checks)
     lines = [
@@ -548,7 +674,7 @@ def section_scorecard(checks: list[tuple[str, bool]]) -> str:
         lines.append(f"| {i} | {label} | {_badge(passed)} |")
     lines += [
         "",
-        "> ℹ️ Correlation audit (Section 5) is advisory and does not affect the scorecard.",
+        "> ℹ️ Correlation audit (Section 5) and VIF audit (Section 6) are advisory and do not affect the scorecard.",
     ]
     return "\n".join(lines)
 
@@ -585,12 +711,14 @@ def generate_report() -> bool:
     s_forbidden,   forbidden_pass = section_forbidden_columns(df)
     s_nulls,       nulls_pass     = section_null_audit(df)
     s_corr,        corr_pass      = section_correlation_audit(df)
+    s_vif,         vif_pass       = section_vif(df)
 
     scorecard = section_scorecard([
-        ("No duplicate (raceId, driverId) keys",     dupes_pass),
-        ("No forbidden / post-race columns present", forbidden_pass),
-        ("Null audit: zero nulls in required columns", nulls_pass),
-        ("Correlation audit (advisory)",              corr_pass),
+        ("No duplicate (raceId, driverId) keys",          dupes_pass),
+        ("No forbidden / post-race columns present",      forbidden_pass),
+        ("Null audit: zero nulls in required columns",    nulls_pass),
+        ("Correlation audit (advisory)",                  corr_pass),
+        ("VIF audit (advisory)",                          vif_pass),
     ])
 
     all_passed = all([dupes_pass, forbidden_pass, nulls_pass])
@@ -625,6 +753,7 @@ def generate_report() -> bool:
         s_forbidden,
         s_nulls,
         s_corr,
+        s_vif,
         footer,
     ])
 
