@@ -277,6 +277,52 @@ def build_modeling_dataset() -> pd.DataFrame:
         df["rolling_podium_rate"] = np.nan
         log.warning("  Could not compute rolling_podium_rate — source columns missing.")
 
+    # ── Step 7a: Impute grid for pit-lane starts ─────────────────────────────
+    # grid is NULL by design for pit-lane starters (grid_pit_lane = 1).
+    # The model cannot consume NaN, so we impute: pit-lane starter gets
+    # max(grid in that race) + 1, which is the standard F1 convention
+    # (effectively: start from behind the entire grid).
+    # grid_pit_lane = 1 remains as an explicit flag so the model knows
+    # the value is imputed — do NOT drop it.
+    log.info("Step 7a — Imputing grid for pit-lane starts ...")
+    if "grid" in df.columns and "grid_pit_lane" in df.columns and "raceId" in df.columns:
+        # Max grid position per race (ignoring pit-lane starts)
+        race_max_grid = (
+            df[df["grid"].notna()]
+            .groupby("raceId")["grid"]
+            .max()
+            .rename("_race_max_grid")
+        )
+        df = df.join(race_max_grid, on="raceId")
+
+        n_pl_starts = int((df["grid_pit_lane"] == 1).sum())
+        n_grid_null = int(df["grid"].isna().sum())
+
+        df["grid_imputed"] = np.where(
+            df["grid"].isna(),
+            df["_race_max_grid"] + 1,
+            df["grid"],
+        )
+        df = df.drop(columns=["_race_max_grid"])
+
+        # Verify: any remaining nulls in grid_imputed mean the entire race had
+        # no grid data (very early era edge case — should not happen post-2000)
+        n_still_null = int(df["grid_imputed"].isna().sum())
+        log.info(
+            "  Pit-lane starts: %d rows  |  grid nulls before: %d  |  grid_imputed nulls: %d",
+            n_pl_starts, n_grid_null, n_still_null,
+        )
+        if n_still_null:
+            log.warning(
+                "  ⚠ %d rows have null grid_imputed — race had no grid data at all. "
+                "Inspect raceIds: %s",
+                n_still_null,
+                df[df["grid_imputed"].isna()]["raceId"].unique()[:10].tolist(),
+            )
+    else:
+        log.warning("  grid / grid_pit_lane / raceId not found — skipping grid imputation.")
+        df["grid_imputed"] = df.get("grid", np.nan)
+
     # ── Step 7: has_prev_season flag + null-fill ─────────────────────────────
     log.info("Step 7 — Applying null-fill rules ...")
 
@@ -350,6 +396,7 @@ def build_modeling_dataset() -> pd.DataFrame:
     log.info("  Podiums        : %d (%.1f%%)", n_podium, podium_pct)
     log.info("  Non-podiums    : %d (%.1f%%)", n_total - n_podium, 100 - podium_pct)
     log.info("  Rookies        : %d (has_prev_season = 0)", int((df["has_prev_season"] == 0).sum()))
+    log.info("  Pit-lane starts: %d (grid_pit_lane = 1, grid_imputed used)", int((df.get("grid_pit_lane", pd.Series(dtype=int)) == 1).sum()) if "grid_pit_lane" in df.columns else 0)
     log.info("  Columns list   : %s", list(df.columns))
     log.info("=" * 60)
 

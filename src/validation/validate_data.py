@@ -49,15 +49,15 @@ except ImportError:
 # ── Configuration ──────────────────────────────────────────────────────────────
 INTERIM_DIR   = Path("data/interim")
 PROCESSED_DIR = Path("data/processed")
-FEATURES_DIR    = PROCESSED_DIR / "features"
+FEATURES_DIR  = PROCESSED_DIR / "features"
 REPORT_PATH   = Path("reports/data_quality/data_quality_report.md")
 
-# Parquet feature store paths (all live in data/processed/)
-DRIVER_RACE_FULL_PARQUET        = FEATURES_DIR / "driver_race_full.parquet"
-DRIVER_RACE_PRE_PARQUET         = FEATURES_DIR / "driver_race_pre.parquet"
-DRIVER_SEASON_PARQUET           = FEATURES_DIR / "driver_season_features.parquet"
-CONSTRUCTOR_SEASON_PARQUET      = FEATURES_DIR / "constructor_season_features.parquet"
-DRIVER_RACE_ROLLING_PARQUET     = FEATURES_DIR / "driver_race_rolling.parquet"
+# Parquet feature store paths — all read from data/processed/features/
+DRIVER_RACE_FULL_PARQUET         = FEATURES_DIR / "driver_race_full.parquet"
+DRIVER_RACE_PRE_PARQUET          = FEATURES_DIR / "driver_race_pre.parquet"
+DRIVER_SEASON_PARQUET            = FEATURES_DIR / "driver_season_features.parquet"
+CONSTRUCTOR_SEASON_PARQUET       = FEATURES_DIR / "constructor_season_features.parquet"
+DRIVER_RACE_ROLLING_PARQUET      = FEATURES_DIR / "driver_race_rolling.parquet"
 CONSTRUCTOR_RACE_ROLLING_PARQUET = FEATURES_DIR / "constructor_race_rolling.parquet"
 
 # Foreign key relationships: (child_table, child_col) → (parent_table, parent_col)
@@ -197,8 +197,13 @@ BOUNDS_CHECKS = [
     ("driver_race_full", "avg_pit_duration_ms", "<", 0,  "FAIL", "Pit duration cannot be negative"),
     ("driver_race_full", "is_dnf",           "<",  0,    "FAIL", "is_dnf must be 0 or 1"),
     ("driver_race_full", "is_dnf",           ">",  1,    "FAIL", "is_dnf must be 0 or 1"),
+    # grid_pit_lane must be strictly binary (0 or 1) — never null after build_features fix
+    ("driver_race_full", "grid_pit_lane",    "<",  0,    "FAIL", "grid_pit_lane must be 0 or 1"),
+    ("driver_race_full", "grid_pit_lane",    ">",  1,    "FAIL", "grid_pit_lane must be 0 or 1"),
     # driver_race_pre
-    ("driver_race_pre", "grid",             "<",  0,    "FAIL", "Grid position cannot be negative"),
+    ("driver_race_pre", "grid",              "<",  0,    "FAIL", "Grid position cannot be negative"),
+    ("driver_race_pre", "grid_pit_lane",     "<",  0,    "FAIL", "grid_pit_lane must be 0 or 1"),
+    ("driver_race_pre", "grid_pit_lane",     ">",  1,    "FAIL", "grid_pit_lane must be 0 or 1"),
     # driver_season_features
     ("driver_season", "dnf_rate",       "<",  0,    "FAIL", "Rate cannot be negative"),
     ("driver_season", "dnf_rate",       ">",  1,    "FAIL", "Rate cannot exceed 1.0"),
@@ -759,7 +764,12 @@ def section_feature_duplicate_keys(
 
         dupe_count = int(df.duplicated(subset=key_cols).sum())
 
-        if table_key.startswith("driver_race") and dupe_count > 0:
+        # Tables with (raceId, driverId) keys can have legitimate duplicates
+        # (dual-constructor entries, shared drives) that need classification.
+        # This applies equally to full, pre, and rolling driver-race tables.
+        DRIVER_RACE_TABLES = {"driver_race_full", "driver_race_pre", "driver_race_rolling"}
+
+        if table_key in DRIVER_RACE_TABLES and dupe_count > 0:
             dupe_mask = df.duplicated(subset=key_cols, keep=False)
             dupe_df   = df[dupe_mask].copy()
             unexplained_pairs: set[tuple] = set()

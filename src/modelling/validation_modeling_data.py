@@ -1,5 +1,5 @@
 """
-src/modelling/validation_modeling_data.py
+src/validation/validate_modeling_dataset.py
 ---------------------------------------------
 Validates the final modeling dataset before any model training begins.
 Outputs: reports/data_quality/modeling_dataset_validation.md
@@ -25,7 +25,7 @@ It reports problems and exits with code 1 if any FAIL-level check fails,
 so it can be used as a CI gate before model training.
 
 Run:
-  python src/modelling/validation_modeling_data.py
+  python src/validation/validate_modeling_dataset.py
 """
 
 import sys
@@ -74,8 +74,8 @@ except ImportError:
 REQUIRED_COLUMNS: list[str] = [
     # Identifiers
     "raceId", "driverId", "constructorId", "race_year", "round", "circuitId",
-    # Race setup
-    "grid", "grid_pit_lane",
+    # Race setup — grid is nullable (pit-lane starts); grid_imputed is always filled
+    "grid", "grid_pit_lane", "grid_imputed",
     # Driver rolling
     "rolling_cumulative_points",
     "rolling_cumulative_podiums",
@@ -98,32 +98,45 @@ REQUIRED_COLUMNS: list[str] = [
     "is_podium",
 ]
 
-# Columns that must have zero nulls regardless of round
+# Columns that must have zero nulls regardless of any context
+# NOTE: grid is intentionally absent — it is NULL for pit-lane starts by design.
+#       grid_imputed is the model-safe version and must be 0 nulls.
 ZERO_NULL_ALWAYS: list[str] = [
     "raceId", "driverId", "constructorId",
     "race_year", "round", "circuitId",
     "grid_pit_lane",
+    "grid_imputed",       # imputed version — always filled
     "is_podium",
     "has_prev_season",
     "prev_season_points",
     "prev_season_podium_rate",
 ]
 
-# Rolling columns that may only be null on round == 1
-# (build step fills these with 0, so post-build should also be 0 null)
+# Rolling columns where 0 nulls are required post-build
+# (build step fills round-1 NaNs with 0).
+# Excluded from this list:
+#   rolling_avg_qualifying_position  — can stay NaN past round 1 if qualifying_position
+#                                      was null (pit-lane start, penalty, early era gap)
+#   rolling_avg_finish_position      — can stay NaN past round 1 if driver had only DNFs
+#   con_rolling_avg_finish_position  — same: constructor may have had 0 finishers in prior rounds
+# These three are validated as ADVISORY only (see section_null_audit).
 ROLLING_COLS: list[str] = [
     "rolling_cumulative_points",
     "rolling_cumulative_podiums",
     "rolling_podium_rate",
     "rolling_dnf_rate",
-    "rolling_avg_finish_position",
-    "rolling_avg_qualifying_position",
     "rolling_races_counted",
     "con_rolling_cumulative_points",
     "con_rolling_podium_rate",
     "con_rolling_dnf_rate",
-    "con_rolling_avg_finish_position",
     "con_rolling_races_counted",
+]
+
+# Rolling position columns validated as advisory (justified nulls beyond round 1)
+ROLLING_COLS_ADVISORY: list[str] = [
+    "rolling_avg_finish_position",
+    "rolling_avg_qualifying_position",
+    "con_rolling_avg_finish_position",
 ]
 
 # Correlation threshold — pairs above this are flagged (advisory, not fail)
@@ -281,70 +294,132 @@ def section_forbidden_columns(df: pd.DataFrame) -> tuple[str, bool]:
 
 def section_null_audit(df: pd.DataFrame) -> tuple[str, bool]:
     """
-    Null rules:
-      - ZERO_NULL_ALWAYS cols    → 0 nulls required (FAIL if any)
-      - ROLLING_COLS             → 0 nulls required post-build (build fills round-1
-                                   NaNs with 0); FAIL if any nulls remain
-      - grid                     → FAIL if any nulls (grid should always be known)
-      - Other columns            → advisory only (WARN if > 5%)
+    Null rules per column category:
+
+      ZERO_NULL_ALWAYS cols              → 0 nulls required (FAIL if any)
+        Includes grid_imputed but NOT grid.
+
+      grid (raw)                         → null JUSTIFIED when grid_pit_lane == 1
+                                           FAIL only if null where grid_pit_lane == 0
+
+      ROLLING_COLS                       → 0 nulls required post-build
+                                           (build fills round-1 NaNs with 0)
+
+      ROLLING_COLS_ADVISORY              → advisory only; nulls justified by:
+        rolling_avg_finish_position        DNF rows have no finish_position
+        rolling_avg_qualifying_position    pit-lane starts / penalties have no quali pos
+        con_rolling_avg_finish_position    constructor may have 0 finishers in a round
+
+      qualifying_position                → advisory with context note
+        (null for pit-lane starts, penalties, early era)
+
+      All other columns                  → advisory (WARN if > 5%, moderate if > 20%)
     """
     lines    = ["## 4. Null Audit", ""]
     any_fail = False
+
+    has_grid_pit_lane = "grid_pit_lane" in df.columns and "grid" in df.columns
 
     lines += [
         "| Column | Null Count | Null % | Rule | Result |",
         "|--------|----------:|-------:|------|:------:|",
     ]
 
-    # Determine rule per column
-    def _check_col(col: str) -> tuple[int, str, str, bool]:
+    for col in df.columns:
         if col not in df.columns:
-            return 0, "—", "⚠️ Column missing", False
+            continue
 
         n_null   = int(df[col].isna().sum())
         null_pct = n_null / len(df) * 100 if len(df) > 0 else 0.0
         pct_str  = f"{null_pct:.2f}%"
 
-        if col in ZERO_NULL_ALWAYS:
-            rule   = "Must be 0"
-            passed = n_null == 0
-            result = _badge(passed)
-        elif col == "grid":
-            rule   = "Must be 0"
-            passed = n_null == 0
-            result = _badge(passed)
-        elif col in ROLLING_COLS:
-            rule   = "Must be 0 (build fills round-1)"
-            passed = n_null == 0
-            result = _badge(passed)
-        else:
-            # Advisory for other columns
-            passed = True   # does not fail scorecard
-            if n_null == 0:
-                rule   = "Advisory"
-                result = "✅ Clean"
-            elif null_pct < 5:
-                rule   = "Advisory"
-                result = "⚠️ Minor"
+        # ── grid: context-aware check ──────────────────────────────────────
+        if col == "grid":
+            if has_grid_pit_lane:
+                # Nulls are only allowed where grid_pit_lane == 1
+                unjustified = int(df[df["grid"].isna() & (df["grid_pit_lane"] == 0)].shape[0])
+                pl_nulls    = int(df[df["grid"].isna() & (df["grid_pit_lane"] == 1)].shape[0])
+                passed      = unjustified == 0
+                if not passed:
+                    any_fail = True
+                rule   = "Null OK if grid_pit_lane=1 only"
+                result = (
+                    f"{_badge(passed)} ({pl_nulls} pit-lane justified, {unjustified} unexplained)"
+                )
             else:
-                rule   = "Advisory"
-                result = "🔶 Moderate"
+                # grid_pit_lane not available — fall back to advisory
+                rule   = "Advisory (grid_pit_lane not present)"
+                passed = True
+                result = f"⚠️ Cannot verify — grid_pit_lane missing"
+            lines.append(f"| `{col}` | {n_null:,} | {pct_str} | {rule} | {result} |")
+            continue
 
-        return n_null, pct_str, rule, passed
+        # ── grid_imputed: must be 0 nulls ─────────────────────────────────
+        if col in ZERO_NULL_ALWAYS:
+            passed = n_null == 0
+            if not passed:
+                any_fail = True
+            rule   = "Must be 0"
+            result = _badge(passed)
+            lines.append(f"| `{col}` | {n_null:,} | {pct_str} | {rule} | {result} |")
+            continue
 
-    for col in df.columns:
-        n_null, pct_str, rule, passed = _check_col(col)
-        if not passed:
-            any_fail = True
-        lines.append(f"| `{col}` | {n_null:,} | {pct_str} | {rule} | {_badge(passed) if rule != 'Advisory' else (pct_str if n_null else '✅ Clean')} |")
+        # ── rolling cols (hard zero) ───────────────────────────────────────
+        if col in ROLLING_COLS:
+            passed = n_null == 0
+            if not passed:
+                any_fail = True
+            rule   = "Must be 0 (build fills round-1)"
+            result = _badge(passed)
+            lines.append(f"| `{col}` | {n_null:,} | {pct_str} | {rule} | {result} |")
+            continue
+
+        # ── rolling position cols (advisory — justified nulls) ─────────────
+        if col in ROLLING_COLS_ADVISORY:
+            if n_null == 0:
+                result = "✅ Clean"
+            else:
+                result = f"ℹ️ Justified ({n_null:,} rows)"
+            rule = "Advisory — DNF/pit-lane nulls expected"
+            lines.append(f"| `{col}` | {n_null:,} | {pct_str} | {rule} | {result} |")
+            continue
+
+        # ── qualifying_position: contextual advisory ───────────────────────
+        if col == "qualifying_position":
+            rule = "Advisory — null for pit-lane starts, penalties, early era"
+            if n_null == 0:
+                result = "✅ Clean"
+            elif null_pct < 10:
+                result = "ℹ️ Minor (expected)"
+            else:
+                result = f"⚠️ {pct_str} — investigate if > 10%"
+            lines.append(f"| `{col}` | {n_null:,} | {pct_str} | {rule} | {result} |")
+            continue
+
+        # ── everything else: advisory ──────────────────────────────────────
+        if n_null == 0:
+            result = "✅ Clean"
+        elif null_pct < 5:
+            result = "⚠️ Minor"
+        elif null_pct < 20:
+            result = "🔶 Moderate"
+        else:
+            result = "❌ High — investigate"
+        lines.append(f"| `{col}` | {n_null:,} | {pct_str} | Advisory | {result} |")
 
     lines += [
         "",
         f"**Overall (FAIL-level checks only):** {_badge(not any_fail)}",
         "",
-        "> ℹ️ Advisory nulls do not fail the scorecard.",
-        "> Rolling cols should have 0 nulls because `build_modeling_dataset.py`",
-        "> fills round-1 NaNs with 0 before saving.",
+        "### Null Rule Legend",
+        "",
+        "| Rule | Meaning |",
+        "|------|---------|",
+        "| Must be 0 | Zero nulls required — FAIL if any present |",
+        "| Must be 0 (build fills round-1) | Rolling cols filled by build script — FAIL if any remain |",
+        "| Null OK if grid_pit_lane=1 only | Raw grid — null justified only for pit-lane starters |",
+        "| Advisory — DNF/pit-lane nulls expected | Position rolling cols — nulls OK, do not fail |",
+        "| Advisory | Informational only — does not affect scorecard |",
     ]
 
     return "\n".join(lines), not any_fail

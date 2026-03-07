@@ -5,11 +5,11 @@ Produces the final analysis-ready master race table and loads all
 cleaned tables into a SQLite database for SQL-based analysis.
 Also builds five feature-store parquet files for modelling:
 
-  data/processed/driver_race_features.parquet       (2.1)
-  data/processed/driver_season_features.parquet     (2.2)
-  data/processed/constructor_season_features.parquet(2.3)
-  data/processed/driver_race_rolling.parquet        (2.4)
-  data/processed/constructor_race_rolling.parquet   (2.5)
+  data/processed/features/driver_race_features.parquet       (2.1)
+  data/processed/features/driver_season_features.parquet     (2.2)
+  data/processed/features/constructor_season_features.parquet(2.3)
+  data/processed/features/driver_race_rolling.parquet        (2.4)
+  data/processed/features/constructor_race_rolling.parquet   (2.5)
 
 Rolling feature tables (2.4, 2.5) contain cumulative within-season stats
 up to (but NOT including) the current race — i.e. all values are shifted
@@ -92,19 +92,20 @@ _CONFIG = _load_config()
 INTERIM_DIR   = Path(_CONFIG.get("paths", {}).get("interim_data",   "data/interim"))
 PROCESSED_DIR = Path(_CONFIG.get("paths", {}).get("processed_data", "data/processed"))
 SQL_DIR       = Path(_CONFIG.get("paths", {}).get("sql_dir",        "sql"))
-FEATURES_DIR    = PROCESSED_DIR / "features"
 
 MERGED_FILE       = INTERIM_DIR   / "cleaned_merged_data.csv"
 MASTER_TABLE_FILE = PROCESSED_DIR / "master_race_table.csv"
 DB_FILE           = PROCESSED_DIR / "f1_database.db"
 
-# Parquet output paths
-DRIVER_RACE_FULL_PARQUET        = FEATURES_DIR / "driver_race_full.parquet"
-DRIVER_RACE_PRE_PARQUET         = FEATURES_DIR / "driver_race_pre.parquet"
-DRIVER_SEASON_PARQUET           = FEATURES_DIR / "driver_season_features.parquet"
-CONSTRUCTOR_SEASON_PARQUET      = FEATURES_DIR / "constructor_season_features.parquet"
-DRIVER_RACE_ROLLING_PARQUET     = FEATURES_DIR / "driver_race_rolling.parquet"      # NEW (2.4)
-CONSTRUCTOR_RACE_ROLLING_PARQUET = FEATURES_DIR / "constructor_race_rolling.parquet" # NEW (2.5)
+FEATURES_DIR = PROCESSED_DIR / "features"
+
+# Parquet output paths — all written to data/processed/features/
+DRIVER_RACE_FULL_PARQUET         = FEATURES_DIR / "driver_race_full.parquet"
+DRIVER_RACE_PRE_PARQUET          = FEATURES_DIR / "driver_race_pre.parquet"
+DRIVER_SEASON_PARQUET            = FEATURES_DIR / "driver_season_features.parquet"
+CONSTRUCTOR_SEASON_PARQUET       = FEATURES_DIR / "constructor_season_features.parquet"
+DRIVER_RACE_ROLLING_PARQUET      = FEATURES_DIR / "driver_race_rolling.parquet"
+CONSTRUCTOR_RACE_ROLLING_PARQUET = FEATURES_DIR / "constructor_race_rolling.parquet"
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +489,7 @@ def build_driver_race_features(db_path: Path = DB_FILE) -> pd.DataFrame:
     Keys            : raceId, driverId
     Race context    : race_year, round, circuitId
     Identity        : constructorId
-    Grid / result   : grid, finish_position, positions_gained
+    Grid / result   : grid, grid_pit_lane, finish_position, positions_gained
     Points / flags  : points, is_dnf, is_podium, is_winner, is_points_finish
     Performance     : fastest_lap_rank, qualifying_position, qualifying_gap_ms
                       best_quali_ms, avg_lap_time_ms, lap_time_consistency
@@ -510,6 +511,7 @@ def build_driver_race_features(db_path: Path = DB_FILE) -> pd.DataFrame:
 
             -- Grid / result
             m.grid,
+            m.grid_pit_lane,
             m.position      AS finish_position,
             m.positionOrder AS finish_position_order,
 
@@ -584,7 +586,8 @@ def build_driver_race_features(db_path: Path = DB_FILE) -> pd.DataFrame:
     keep = [
         "raceId", "driverId", "constructorId",
         "race_year", "round", "circuitId",
-        "grid", "finish_position", "finish_position_order", "positions_gained",
+        "grid", "grid_pit_lane",                                      # ← grid_pit_lane added
+        "finish_position", "finish_position_order", "positions_gained",
         "points", "is_dnf", "is_podium", "is_winner", "is_points_finish",
         "fastest_lap_rank", "qualifying_position", "qualifying_gap_ms",
         "best_quali_ms", "avg_lap_time_ms", "lap_time_consistency", "fastest_lap_ms",
@@ -596,7 +599,8 @@ def build_driver_race_features(db_path: Path = DB_FILE) -> pd.DataFrame:
     int_cols = [
         "raceId", "driverId", "constructorId",
         "race_year", "round", "circuitId",
-        "grid", "finish_position", "finish_position_order",
+        "grid", "grid_pit_lane",                                      # ← grid_pit_lane added
+        "finish_position", "finish_position_order",
         "is_dnf", "is_podium", "is_winner", "is_points_finish",
         "fastest_lap_rank", "qualifying_position", "pit_stop_count", "pit_data_incomplete",
     ]

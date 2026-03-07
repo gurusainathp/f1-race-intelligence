@@ -1,6 +1,6 @@
 # Data Quality Report
 
-> **Generated:** 2026-03-04 23:10:34  
+> **Generated:** 2026-03-07 15:12:46  
 > **Source (raw):** `data\interim`  
 > **Source (features):** `data\processed\features`  
 > **Tables loaded:** 9  
@@ -316,7 +316,11 @@
 | `driver_race_full` | `avg_pit_duration_ms` | `avg_pit_duration_ms` < 0 | 0 | ❌ FAIL | ✅ PASS |
 | `driver_race_full` | `is_dnf` | `is_dnf` < 0 | 0 | ❌ FAIL | ✅ PASS |
 | `driver_race_full` | `is_dnf` | `is_dnf` > 1 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race_full` | `grid_pit_lane` | `grid_pit_lane` < 0 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race_full` | `grid_pit_lane` | `grid_pit_lane` > 1 | 0 | ❌ FAIL | ✅ PASS |
 | `driver_race_pre` | `grid` | `grid` < 0 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race_pre` | `grid_pit_lane` | `grid_pit_lane` < 0 | 0 | ❌ FAIL | ✅ PASS |
+| `driver_race_pre` | `grid_pit_lane` | `grid_pit_lane` > 1 | 0 | ❌ FAIL | ✅ PASS |
 | `driver_race_rolling` | `rolling_cumulative_points` | `rolling_cumulative_points` < 0 | 0 | ❌ FAIL | ✅ PASS |
 | `driver_race_rolling` | `rolling_cumulative_podiums` | `rolling_cumulative_podiums` < 0 | 0 | ❌ FAIL | ✅ PASS |
 | `driver_race_rolling` | `rolling_cumulative_wins` | `rolling_cumulative_wins` < 0 | 0 | ❌ FAIL | ✅ PASS |
