@@ -1,14 +1,15 @@
 """
-src/data/constants.py
----------------------
+src/utils/constants.py
+----------------------
 Single source of truth for F1 status / DNF classification
 AND shared numeric thresholds used across the pipeline.
 
 Imported by:
-  - clean_data.py
-  - validate_data.py
-  - merge_data.py
-  - build_master_table.py
+  - src/data_processing/02_clean_data.py
+  - src/validation/validate_data.py
+  - src/data_processing/04_merge_data.py
+  - src/feature_engineering/build_features.py
+  - src/modelling/build_modeling_dataset.py
 
 DO NOT duplicate these values elsewhere. Change them here and every
 script in the pipeline picks up the update automatically.

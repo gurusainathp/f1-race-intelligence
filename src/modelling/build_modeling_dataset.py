@@ -1,6 +1,6 @@
 """
-src/modeling/build_modeling_dataset.py
----------------------------------------
+src/modelling/build_modeling_dataset.py
+----------------------------------------
 Assembles the final modeling-ready dataset for predicting `is_podium`.
 
 Reads five parquet feature stores from data/processed/features/ and

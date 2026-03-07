@@ -6,7 +6,7 @@ from pathlib import Path
 import yaml
 
 
-# Root directory (project root)
+# Root directory is 2 levels up: src/config.py -> src/ -> project root
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 

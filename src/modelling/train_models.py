@@ -1,7 +1,7 @@
 """
-src/modeling/train_models.py
+src/modelling/train_models.py
 -----------------------------
-Train and evaluate two models for predicting `is_podium`.
+Train and evaluate three models for predicting `is_podium`.
 
 Task
 ----
@@ -11,7 +11,8 @@ Task
 Models
 ------
   1. Logistic Regression   — baseline, interpretable, coefficient analysis
-  2. XGBoost               — main model, handles nonlinear racing dynamics
+  2. Random Forest         — ensemble model with feature importance rankings
+  3. XGBoost               — gradient boosting, handles nonlinear racing dynamics
 
 Time-based split (NO random shuffle — simulates predicting future seasons)
 --------------------------------------------------------------------------
@@ -23,17 +24,18 @@ Evaluation metrics
 ------------------
   Primary  : ROC-AUC
   Also     : Precision, Recall, F1, Precision@3 (3 podium spots per race)
-  Reports  : Classification report + confusion matrix + Precision@3 table
+  Reports  : Classification report + confusion matrix + Precision@3 table + feature importances
 
 Outputs
 -------
   models/logistic_regression.pkl
+  models/random_forest_podium_model.pkl
   models/xgboost_podium_model.pkl    (or sklearn_gb_podium_model.pkl if xgboost absent)
   reports/model_evaluation.md
 
 Run
 ---
-  python src/modeling/train_models.py
+  python src/modelling/train_models.py
 """
 
 import logging
@@ -45,6 +47,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     classification_report,
@@ -279,6 +282,22 @@ def _build_logistic_regression() -> Pipeline:
     ])
 
 
+def _build_random_forest() -> RandomForestClassifier:
+    """
+    Random Forest with class weight balancing for imbalanced dataset (~6:1 ratio).
+    Provides ensemble diversity to complement gradient boosting.
+    """
+    return RandomForestClassifier(
+        n_estimators=200,
+        max_depth=8,
+        min_samples_split=10,
+        min_samples_leaf=4,
+        class_weight="balanced",
+        random_state=42,
+        n_jobs=-1,  # parallel processing
+    )
+
+
 def _build_gradient_boosting():
     """
     XGBoost if available, else sklearn HistGradientBoostingClassifier.
@@ -361,8 +380,10 @@ def _xgb_importance_table(model, top_n: int = 15) -> str:
 
 def _generate_report(
     lr_metrics: dict,
+    rf_metrics: dict,
     gb_metrics: dict,
     lr_model: Pipeline,
+    rf_model: RandomForestClassifier,
     gb_model,
     split_info: dict,
 ) -> str:
@@ -393,13 +414,13 @@ def _generate_report(
     sections.append("\n".join([
         "## 0. Model Comparison Summary",
         "",
-        f"| Metric | Logistic Regression | {gb_label} |",
-        "|--------|--------------------:|" + "-" * 22 + ":|",
-        f"| **ROC-AUC** | **{lr_metrics['auc']:.4f}** | **{gb_metrics['auc']:.4f}** |",
-        f"| Precision@{K} | {lr_metrics['p_at_k']:.4f} | {gb_metrics['p_at_k']:.4f} |",
-        f"| Precision (podium) | {lr_metrics['precision']:.4f} | {gb_metrics['precision']:.4f} |",
-        f"| Recall (podium) | {lr_metrics['recall']:.4f} | {gb_metrics['recall']:.4f} |",
-        f"| F1 (podium) | {lr_metrics['f1']:.4f} | {gb_metrics['f1']:.4f} |",
+        f"| Metric | Logistic Regression | Random Forest | {gb_label} |",
+        "|--------|--------------------:|---------------:|" + "-" * 22 + ":|",
+        f"| **ROC-AUC** | **{lr_metrics['auc']:.4f}** | **{rf_metrics['auc']:.4f}** | **{gb_metrics['auc']:.4f}** |",
+        f"| Precision@{K} | {lr_metrics['p_at_k']:.4f} | {rf_metrics['p_at_k']:.4f} | {gb_metrics['p_at_k']:.4f} |",
+        f"| Precision (podium) | {lr_metrics['precision']:.4f} | {rf_metrics['precision']:.4f} | {gb_metrics['precision']:.4f} |",
+        f"| Recall (podium) | {lr_metrics['recall']:.4f} | {rf_metrics['recall']:.4f} | {gb_metrics['recall']:.4f} |",
+        f"| F1 (podium) | {lr_metrics['f1']:.4f} | {rf_metrics['f1']:.4f} | {gb_metrics['f1']:.4f} |",
         "",
         "> **ROC-AUC** is the primary metric. Random baseline = 0.50.",
         f"> **Precision@{K}**: fraction of the top-{K} predicted drivers per race "
@@ -452,9 +473,37 @@ def _generate_report(
         _coef_table(lr_model),
     ]))
 
+    # ── Random Forest ─────────────────────────────────────────────────────────
+    sections.append("\n".join([
+        "## 3. Random Forest (Ensemble Model)",
+        "",
+        "**Purpose:** Ensemble method providing diversity to offset gradient boosting's sequential nature.",
+        "**Class imbalance:** class_weight=balanced (compensates for ~14% podium rate).",
+        "",
+        "### Metrics (Test Set)",
+        "",
+        "| Metric | Value |",
+        "|--------|------:|",
+        f"| ROC-AUC | {rf_metrics['auc']:.4f} |",
+        f"| Precision@{K} | {rf_metrics['p_at_k']:.4f} |",
+        f"| Precision (podium class) | {rf_metrics['precision']:.4f} |",
+        f"| Recall (podium class) | {rf_metrics['recall']:.4f} |",
+        f"| F1 (podium class) | {rf_metrics['f1']:.4f} |",
+        "",
+        "### Confusion Matrix",
+        "",
+        _cm_table(rf_metrics["cm"]),
+        "",
+        "### Feature Importances (Top 15)",
+        "",
+        "> Decrease in impurity: how much each feature reduces Gini impurity across splits.",
+        "",
+        _xgb_importance_table(rf_model),
+    ]))
+
     # ── Gradient Boosting ─────────────────────────────────────────────────────
     sections.append("\n".join([
-        f"## 3. {gb_label} (Main Model)",
+        f"## 4. {gb_label} (Main Model)",
         "",
         "**Purpose:** Captures nonlinear racing dynamics and interaction effects.",
         "**Class imbalance:** scale_pos_weight=6 (approx non-podium / podium ratio).",
@@ -482,7 +531,7 @@ def _generate_report(
 
     # ── Feature Reference ─────────────────────────────────────────────────────
     sections.append("\n".join([
-        "## 4. Feature Reference",
+        "## 5. Feature Reference",
         "",
         "| Group | Features |",
         "|-------|---------|",
@@ -551,7 +600,21 @@ def train() -> None:
     joblib.dump(lr_model, lr_path)
     log.info("  Saved → %s", lr_path)
 
-    # ── Model 2: Gradient Boosting ────────────────────────────────────────────
+    # ── Model 2: Random Forest ────────────────────────────────────────────────
+    log.info("=" * 55)
+    log.info("Training Random Forest ...")
+    rf_model = _build_random_forest()
+    rf_model.fit(X_train, y_train)
+    log.info("  Training complete.")
+
+    log.info("Evaluating Random Forest on test set ...")
+    rf_metrics = _evaluate("Random Forest", rf_model, X_test, y_test, test_df)
+
+    rf_path = MODELS_DIR / "random_forest_podium_model.pkl"
+    joblib.dump(rf_model, rf_path)
+    log.info("  Saved → %s", rf_path)
+
+    # ── Model 3: Gradient Boosting ────────────────────────────────────────────
     log.info("=" * 55)
     log.info("Training %s ...", "XGBoost" if _XGB_AVAILABLE else "HistGradientBoostingClassifier")
     gb_model = _build_gradient_boosting()
@@ -568,7 +631,7 @@ def train() -> None:
     # ── Report ────────────────────────────────────────────────────────────────
     log.info("=" * 55)
     log.info("Writing evaluation report ...")
-    report_md = _generate_report(lr_metrics, gb_metrics, lr_model, gb_model, split_info)
+    report_md = _generate_report(lr_metrics, rf_metrics, gb_metrics, lr_model, rf_model, gb_model, split_info)
     REPORT_PATH.write_text(report_md, encoding="utf-8")
     log.info("  Saved → %s", REPORT_PATH)
 
@@ -577,6 +640,8 @@ def train() -> None:
     log.info("RESULTS SUMMARY")
     log.info("  %-35s  AUC=%.4f  P@%d=%.4f", "Logistic Regression",
              lr_metrics["auc"], K, lr_metrics["p_at_k"])
+    log.info("  %-35s  AUC=%.4f  P@%d=%.4f", "Random Forest",
+             rf_metrics["auc"], K, rf_metrics["p_at_k"])
     log.info("  %-35s  AUC=%.4f  P@%d=%.4f", GB_MODEL_NAME,
              gb_metrics["auc"], K, gb_metrics["p_at_k"])
     log.info("=" * 55)

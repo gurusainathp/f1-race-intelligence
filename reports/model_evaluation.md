@@ -1,6 +1,6 @@
 # F1 Podium Prediction — Model Evaluation Report
 
-> **Generated:** 2026-03-07 16:06:21
+> **Generated:** 2026-03-07 17:32:01
 > **Task:** Binary classification — `is_podium` (1 = podium, 0 = no podium)
 > **Features:** 21
 > **Train:** 7,940 rows  (2000–2019)
@@ -12,13 +12,13 @@
 
 ## 0. Model Comparison Summary
 
-| Metric | Logistic Regression | XGBoost |
-|--------|--------------------:|----------------------:|
-| **ROC-AUC** | **0.9235** | **0.9297** |
-| Precision@3 | 0.6014 | 0.6522 |
-| Precision (podium) | 0.4747 | 0.5573 |
-| Recall (podium) | 0.8841 | 0.7754 |
-| F1 (podium) | 0.6177 | 0.6485 |
+| Metric | Logistic Regression | Random Forest | XGBoost |
+|--------|--------------------:|---------------:|----------------------:|
+| **ROC-AUC** | **0.9235** | **0.9267** | **0.9297** |
+| Precision@3 | 0.6014 | 0.6304 | 0.6522 |
+| Precision (podium) | 0.4747 | 0.5000 | 0.5573 |
+| Recall (podium) | 0.8841 | 0.8478 | 0.7754 |
+| F1 (podium) | 0.6177 | 0.6290 | 0.6485 |
 
 > **ROC-AUC** is the primary metric. Random baseline = 0.50.
 > **Precision@3**: fraction of the top-3 predicted drivers per race that actually finished on the podium. Max = 1.0.
@@ -82,7 +82,51 @@ Time-based split — no data leakage across seasons.
 | 14 | `has_prev_season` | +0.0609 | 📈 Increases podium prob |
 | 15 | `con_rolling_dnf_rate` | -0.0596 | 📉 Decreases podium prob |
 
-## 3. XGBoost (Main Model)
+## 3. Random Forest (Ensemble Model)
+
+**Purpose:** Ensemble method providing diversity to offset gradient boosting's sequential nature.
+**Class imbalance:** class_weight=balanced (compensates for ~14% podium rate).
+
+### Metrics (Test Set)
+
+| Metric | Value |
+|--------|------:|
+| ROC-AUC | 0.9267 |
+| Precision@3 | 0.6304 |
+| Precision (podium class) | 0.5000 |
+| Recall (podium class) | 0.8478 |
+| F1 (podium class) | 0.6290 |
+
+### Confusion Matrix
+
+| | Predicted: No Podium | Predicted: Podium |
+|---|---:|---:|
+| **Actual: No Podium** | 664 (TN) | 117 (FP) |
+| **Actual: Podium**    | 21 (FN) | 117 (TP) |
+
+### Feature Importances (Top 15)
+
+> Decrease in impurity: how much each feature reduces Gini impurity across splits.
+
+| Rank | Feature | Importance |
+|-----:|---------|----------:|
+| 1 | `grid_imputed` | 0.2288 ██████████████████████ |
+| 2 | `con_rolling_podium_rate` | 0.1319 █████████████ |
+| 3 | `con_rolling_avg_finish_position` | 0.0968 █████████ |
+| 4 | `rolling_podium_rate` | 0.0871 ████████ |
+| 5 | `qualifying_gap_ms` | 0.0855 ████████ |
+| 6 | `rolling_avg_finish_position` | 0.0749 ███████ |
+| 7 | `con_rolling_win_rate` | 0.0641 ██████ |
+| 8 | `rolling_avg_qualifying_position` | 0.0627 ██████ |
+| 9 | `prev_season_podium_rate` | 0.0475 ████ |
+| 10 | `prev_season_points` | 0.0340 ███ |
+| 11 | `con_rolling_cumulative_points` | 0.0138 █ |
+| 12 | `rolling_cumulative_points` | 0.0138 █ |
+| 13 | `best_quali_ms` | 0.0123 █ |
+| 14 | `con_rolling_dnf_rate` | 0.0105 █ |
+| 15 | `circuitId` | 0.0094 █ |
+
+## 4. XGBoost (Main Model)
 
 **Purpose:** Captures nonlinear racing dynamics and interaction effects.
 **Class imbalance:** scale_pos_weight=6 (approx non-podium / podium ratio).
@@ -126,7 +170,7 @@ Time-based split — no data leakage across seasons.
 | 14 | `rolling_dnf_rate` | 0.0232 ██ |
 | 15 | `rolling_cumulative_points` | 0.0223 ██ |
 
-## 4. Feature Reference
+## 5. Feature Reference
 
 | Group | Features |
 |-------|---------|

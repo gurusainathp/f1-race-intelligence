@@ -22,11 +22,10 @@ Reads:
   data/interim/*_clean.csv               (individual cleaned tables)
   sql/schema.sql                         (table DDL + indexes)
   sql/views.sql                          (analytical views)
-  data/processed/f1_database.db          (for parquet building — built in Step 2)
 
 Writes:
   data/processed/master_race_table.csv
-  data/processed/f1_database.db
+  data/processed/f1_database.db          (SQLite database with schema + imported tables)
   data/processed/features/driver_race_full.parquet
   data/processed/features/driver_race_pre.parquet
   data/processed/features/driver_season_features.parquet
@@ -35,7 +34,8 @@ Writes:
   data/processed/features/constructor_race_rolling.parquet
 
 Pipeline position:
-  src/data_processing/02_clean_data.py -> src/data_processing/04_merge_data.py -> [THIS FILE]
+  src/data_processing/02_clean_data.py -> src/data_processing/03_patch_data.py
+    -> src/data_processing/04_merge_data.py -> [THIS FILE]
 
 Run:
   python src/feature_engineering/build_features.py

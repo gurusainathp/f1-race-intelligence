@@ -1,6 +1,6 @@
 """
-src/validation/validate_modeling_dataset.py
----------------------------------------------
+src/modelling/validation_modeling_data.py
+-------------------------------------------
 Validates the final modeling dataset before any model training begins.
 Outputs: reports/data_quality/modeling_dataset_validation.md
 

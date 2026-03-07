@@ -52,8 +52,14 @@ Example output (reports/race_podium_predictions.md):
 
 Usage
 -----
-  # Predict all test-set races (default, 2023–2024):
+  # Predict all test-set races (default, 2023–2024) using all models:
   python src/inference/predict_race_podium.py
+
+  # Predict using specific model(s):
+  python src/inference/predict_race_podium.py --model lr    # Logistic Regression
+  python src/inference/predict_race_podium.py --model rf    # Random Forest
+  python src/inference/predict_race_podium.py --model xgb   # XGBoost
+  python src/inference/predict_race_podium.py --model both  # Multiple models (default)
 
   # Predict a specific year from the dataset:
   python src/inference/predict_race_podium.py --year 2024
@@ -65,15 +71,13 @@ Usage
   python src/inference/predict_race_podium.py \
     --fixture data/fixtures/2025_australian_gp.csv
 
-  # Choose model (lr | xgb | both):
-  python src/inference/predict_race_podium.py --model xgb
-
   # Include full-field probabilities:
   python src/inference/predict_race_podium.py --full-field
 
 Inputs
 ------
   models/logistic_regression.pkl
+  models/random_forest_podium_model.pkl
   models/xgboost_podium_model.pkl   (or sklearn_gb_podium_model.pkl)
   data/processed/modeling/modeling_dataset.parquet   ← dataset mode
   data/fixtures/2025_australian_gp.csv               ← fixture mode
@@ -135,6 +139,7 @@ DEFAULT_REPORT_PATH    = REPORT_DIR / "race_podium_predictions.md"
 
 # Model file candidates (xgboost first, sklearn fallback)
 LR_MODEL_PATH          = MODELS_DIR / "logistic_regression.pkl"
+RF_MODEL_PATH          = MODELS_DIR / "random_forest_podium_model.pkl"
 XGB_MODEL_PATHS        = [
     MODELS_DIR / "xgboost_podium_model.pkl",
     MODELS_DIR / "sklearn_gb_podium_model.pkl",
@@ -726,6 +731,12 @@ def run(
     if model_choice in ("lr", "both"):
         models["Logistic Regression"] = _load_model(LR_MODEL_PATH, "Logistic Regression")
 
+    if model_choice in ("rf", "both"):
+        if RF_MODEL_PATH.exists():
+            models["Random Forest"] = _load_model(RF_MODEL_PATH, "Random Forest")
+        else:
+            log.warning("Random Forest model not found at %s — skipping", RF_MODEL_PATH)
+
     if model_choice in ("xgb", "both"):
         gb_model, gb_label = _find_gb_model()
         models[gb_label]   = gb_model
@@ -875,8 +886,8 @@ Examples:
              "E.g. 'bahrain', 'monaco', 'british'.",
     )
     parser.add_argument(
-        "--model", choices=["lr", "xgb", "both"], default="both",
-        help="Which model(s) to use. Default: both.",
+        "--model", choices=["lr", "rf", "xgb", "both"], default="both",
+        help="Which model(s) to use (lr=Logistic Regression, rf=Random Forest, xgb=XGBoost). Default: both.",
     )
     parser.add_argument(
         "--output", type=Path, default=DEFAULT_REPORT_PATH,
